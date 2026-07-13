@@ -1,0 +1,63 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+An agent that answers **GAIA benchmark** questions for the Hugging Face "AI Agents Course" Unit 4 assessment, and submits results to the course's scoring API (`agents-course-unit4-scoring.hf.space`) for leaderboard grading.
+
+## Environment & running
+
+No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `python-dotenv`, `requests`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
+
+Requires a `.env` file with:
+- `GOOGLE_API_KEY` — required, Gemini access for `agent.py`
+- `WOLFRAMALPHA_APP_ID` — optional; without it `wolframalpha_query` just returns `WOLFRAMALPHA_NOT_CONFIGURED`
+
+`yt-dlp` must be on `PATH` for the local video-analysis flow, and a local **Ollama** server (`localhost:11434`, model `minicpm-v:8b`) must be running for image/video frame captioning.
+
+No test suite or lint config exists in this repo.
+
+### Common commands
+
+```bash
+# Run a single random GAIA question end-to-end (debugging, verbose by default)
+python3 eval_pipeline.py --mode test-one
+
+# Solve all questions and write a resumable answers file
+python3 eval_pipeline.py --mode build-jsonl --output-file my_submission.jsonl
+
+# Solve + submit one question to the scoring API
+python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --agent-path agent.py
+
+# Replay a specific task instead of a random one (works with test-one via code, or submit-one via flag)
+python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --task-id <task_id>
+
+# Manually pull a low-res video into the local cache for the video-analysis flow
+yt-dlp -f "worstvideo" -o ".cache/video/%(id)s/%(id)s.%(ext)s" "<youtube_url>"
+```
+
+`build-jsonl` and `submit-one` skip/resume already-completed `task_id`s found in the output file, so re-running `build-jsonl` is safe.
+
+## Architecture
+
+**`agent.py`** — the agent core. LangChain tool-calling loop (`run_agent`) around Gemini (`gemini-3.1-flash-lite`). Bound tools: `search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`. The prompts (`SYSTEM_PROMPT`, `OBSERVATION_PROMPT_TEMPLATE`, `CLASSIFICATION_PROMPT_TEMPLATE`, `TOOL_SELECTION_PROMPT_TEMPLATE`, etc., composed via `build_agent_prompt`) enforce a strict **observe → classify → knowledge-lookup** workflow. This is deliberate and load-bearing: it exists to fix specific GAIA failure modes — treating atypical category members correctly (e.g. penguins are birds), never letting one broad search substitute for checking every item in a candidate list one at a time, and choosing the right tool for the question type (Wikipedia = stable definitions/category membership, WolframAlpha = arithmetic/units/equations, web search = fallback/recency). When touching these prompts, preserve that separation of concerns rather than collapsing it.
+
+**`eval_pipeline.py`** — the harness around the agent, calling the GAIA scoring API:
+- Fetches questions (`/random-question`, `/questions`, or by `task_id`).
+- `solve_question()` assembles "evidence blocks": the raw question, any attachment content (via `tools/file_router.py`), and any local video analysis (via `tools/video_local.py`) — then hands it all to `build_agent_prompt` + `run_agent`.
+- `clean_model_answer()` post-processes raw model output before submission: strips code fences/answer prefixes, pulls the trailing number for numeric-hint questions, extracts comma/semicolon-separated lists for list-hint questions. This exists because GAIA scoring requires exact-match formatting — don't bypass it when changing answer generation.
+- `submit_answers()` POSTs `{username, agent_code, answers: [{task_id, submitted_answer}]}` — note the payload key is `submitted_answer` but the local JSONL/record key is `model_answer`.
+
+**`tools/`** — each tool is a standalone `@tool`-decorated function with its own guard logic to keep the agent honest:
+- `search.py` / `search_wikipedia.py` both detect "multi-item list" queries (comma-heavy) and refuse/narrow them to a single candidate, because the agent tends to try to resolve an entire candidate list with one query instead of checking items individually. `search_wikipedia.py` additionally refuses yes/no classification queries, redirecting them to `search_internet`.
+- `wolframalpha_query.py` — thin wrapper over the WolframAlpha `v1/result` API.
+- `get_youtube_transcript.py` — extracts subtitles via `youtube_transcript_api`; returns `NO_TRANSCRIPT_AVAILABLE` on any failure rather than raising, so the agent can fall back to other tools.
+- `video_local.py` — for YouTube videos with no usable transcript: downloads a low-res copy with `yt-dlp`, samples frames, and captions them via a **local Ollama vision model** (`ollama_chat_with_image`, default `minicpm-v:8b`), building a "video state report" (e.g. tracking entity counts/species over time). Reports are cached under `.cache/video/<task_id>/` and reused on rerun.
+- `file_router.py` — routes task attachments by detected type (text/image/video/pdf via extension or byte sniffing) and builds evidence text accordingly; images/video frames go through the same local vision model as `video_local.py`. Caches under `.cache/attachments/<task_id>/`.
+
+## Notes carried over from local dev workflow
+
+- `search_wikipedia` is for definitions/concept disambiguation; `wolframalpha_query` needs `WOLFRAMALPHA_APP_ID` to do anything.
+- If a task has an attachment, the pipeline tries `/files/{task_id}` and appends parsed content to the prompt automatically — no manual step needed.
+- Numeric answers should stay short and bare; the cleaning step in `eval_pipeline.py` depends on this.
