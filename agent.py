@@ -1,8 +1,10 @@
+import json
 import os
 from typing import Any
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from tools.fetch_page import fetch_page
 from tools.get_youtube_transcript import get_youtube_transcript
 from tools.search import search_internet
 from tools.search_wikipedia import search_wikipedia
@@ -20,7 +22,7 @@ if not api_key:
 # Initialize the model using the stable identifier
 llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite")
 
-tools = [search_internet, search_wikipedia, wolframalpha_query, get_youtube_transcript]
+tools = [search_internet, search_wikipedia, wolframalpha_query, get_youtube_transcript, fetch_page]
 llm_with_tools = llm.bind_tools(tools)
 tool_registry = {tool.name: tool for tool in tools}
 SYSTEM_PROMPT = """
@@ -65,6 +67,7 @@ Tool selection guide:
 - Use `search_wikipedia` for stable definitions, taxonomy, category membership, and conceptual clarification.
 - Use `wolframalpha_query` for arithmetic, unit conversion, equations, and other quantitative or symbolic computation.
 - Use `search_internet` for web evidence, recent information, niche sources, or when Wikipedia and WolframAlpha are not enough.
+- Use `fetch_page` when you already know a specific URL (from a search result, the question, or an attachment) and need its actual page text, not just a search snippet. Search results are summaries; use fetch_page to read the source directly, especially for reading-comprehension tasks over a known document (e.g. a textbook page, article, or reference page).
 - If the question can be answered from the provided evidence, do not call an external tool.
 - Do not use WolframAlpha to guess factual knowledge, and do not use Wikipedia to do arithmetic.
 - Use Wikipedia for concept pages and noun-like concepts; use search_internet for yes/no classification questions such as "is X a fruit or vegetable".
@@ -82,6 +85,13 @@ FINALIZE_PROMPT = """
 You already have enough evidence to answer the question.
 Stop calling tools and provide the final answer now.
 Return only the shortest evidence-based answer.
+""".strip()
+
+FINAL_FALLBACK_PROMPT = """
+You have used all available tool-call steps and have not yet given a final answer.
+Tool calls are no longer available.
+Based only on the evidence already gathered in this conversation, give your best-effort answer now.
+If the evidence is genuinely insufficient, say so briefly, then still give your best guess.
 """.strip()
 
 TASK_PROMPT_TEMPLATE = """
@@ -171,7 +181,7 @@ def run_agent(question: str, max_steps: int = 10, verbose: bool = False) -> str:
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=question),
     ]
-    last_response_content = ""
+    seen_calls: set[tuple[str, str]] = set()
 
     _debug_print(verbose, f"[agent] question: {question}")
 
@@ -179,7 +189,6 @@ def run_agent(question: str, max_steps: int = 10, verbose: bool = False) -> str:
         _debug_print(verbose, f"[agent] step {step}: calling model")
         response = llm_with_tools.invoke(messages)
         messages.append(response)
-        last_response_content = response.content or ""
 
         _debug_print(verbose, f"[agent] step {step}: model content: {response.content!r}")
         _debug_print(verbose, f"[agent] step {step}: tool_calls: {response.tool_calls}")
@@ -196,7 +205,16 @@ def run_agent(question: str, max_steps: int = 10, verbose: bool = False) -> str:
                 raise ValueError(f"Unknown tool requested: {tool_name}")
 
             _debug_print(verbose, f"[agent] step {step}: tool call {tool_index}: {_tool_call_summary(tool_call)}")
-            tool_output = tool.invoke(tool_call["args"])
+
+            call_key = (tool_name, json.dumps(tool_call["args"], sort_keys=True, default=str))
+            if call_key in seen_calls:
+                tool_output = (
+                    "ALREADY_TRIED: this exact tool call was already made earlier and did not lead to "
+                    "a final answer. Do not repeat it; use a different query, URL, or tool instead."
+                )
+            else:
+                tool_output = tool.invoke(tool_call["args"])
+                seen_calls.add(call_key)
             _debug_print(verbose, f"[agent] step {step}: tool output {tool_index}: {tool_output!r}")
             messages.append(
                 ToolMessage(
@@ -208,10 +226,11 @@ def run_agent(question: str, max_steps: int = 10, verbose: bool = False) -> str:
         if step >= 3:
             messages.append(HumanMessage(content=FINALIZE_PROMPT))
 
-    raise RuntimeError(
-        "Agent reached max_steps without producing a final answer. "
-        f"Last model content: {last_response_content!r}"
-    )
+    _debug_print(verbose, "[agent] max_steps reached: forcing a tool-free best-effort answer")
+    messages.append(HumanMessage(content=FINAL_FALLBACK_PROMPT))
+    fallback_response = llm.invoke(messages)
+    _debug_print(verbose, f"[agent] fallback content: {fallback_response.content!r}")
+    return _normalize_answer_content(fallback_response.content)
 
 
 
