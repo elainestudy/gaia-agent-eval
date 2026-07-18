@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(**/.env*)",
+      "Edit(**/.env*)",
+      "Grep(**/.env*)"
+    ]
+  },
+   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e 'const input = require(\"fs\").readFileSync(0, \"utf-8\"); if (/\\.env|secret|credential/i.test(input)) { console.error(\"Security Block: Access to sensitive files via Read/Grep is strictly prohibited.\"); process.exit(2); } process.exit(0);'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e 'const input = require(\"fs\").readFileSync(0, \"utf-8\"); if (/\\.env|secret|credential/i.test(input)) { console.error(\"Security Block: Bash command is blocked because it references secret files.\"); process.exit(2); } process.exit(0);'"
+          }
+        ]
+      }
+    ]
+  }
+}
