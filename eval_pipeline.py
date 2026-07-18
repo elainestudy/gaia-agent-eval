@@ -169,7 +169,7 @@ def compact_video_report(report: str) -> str:
     return "\n".join(compact_lines)
 
 
-def solve_question(question: dict[str, Any], verbose: bool = False) -> str:
+def solve_question(question: dict[str, Any], verbose: bool = False, diagnostics: dict[str, Any] | None = None) -> str:
     base_question = str(question.get("question", ""))
     task_id = str(question.get("task_id", ""))
 
@@ -199,7 +199,7 @@ def solve_question(question: dict[str, Any], verbose: bool = False) -> str:
         evidence_blocks=evidence_blocks[1:],
         task_notes=task_notes,
     )
-    return run_agent(prompt, verbose=verbose)
+    return run_agent(prompt, verbose=verbose, diagnostics=diagnostics)
 
 
 def write_jsonl(results: list[dict[str, Any]], output_file: Path = DEFAULT_OUTPUT_FILE) -> None:
@@ -340,11 +340,13 @@ def build_answer_jsonl(output_file: Path = DEFAULT_OUTPUT_FILE, verbose: bool = 
         print(f"\n[{index}/{len(questions)}] Solving task {task_id}...")
 
         try:
-            answer = solve_question(question, verbose=verbose)
+            diagnostics: dict[str, Any] = {}
+            answer = solve_question(question, verbose=verbose, diagnostics=diagnostics)
             clean_answer = clean_model_answer(answer, str(question.get("question", "")))
             record = {
                 "task_id": task_id,
                 "model_answer": clean_answer,
+                "used_fallback": diagnostics.get("used_fallback", False),
             }
             append_jsonl_record(output_file, record)
             results.append(record)

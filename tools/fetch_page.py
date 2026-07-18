@@ -1,16 +1,37 @@
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
+from urllib.parse import urlparse
 
 import requests
 from langchain_core.tools import tool
 
 JINA_READER_BASE = "https://r.jina.ai/"
 MAX_RESPONSE_CHARS = 10000
-DYNAMIC_RENDER_MARKERS = (
-    "property get [Map MindTouch",
-    "This action is not available",
-)
+# Highly distinctive MindTouch/Jina error signature (a raw C# reflection type name) —
+# unlike a generic phrase, this essentially never appears in legitimate page content.
+DYNAMIC_RENDER_MARKERS = ("property get [Map MindTouch",)
+
+
+def _targets_private_network(url: str) -> bool:
+    hostname = urlparse(url).hostname
+    if not hostname:
+        return True
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        resolved_ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+    except (socket.gaierror, ValueError):
+        return False
+    return (
+        resolved_ip.is_private
+        or resolved_ip.is_loopback
+        or resolved_ip.is_link_local
+        or resolved_ip.is_reserved
+        or resolved_ip.is_multicast
+    )
 
 
 @tool
@@ -21,6 +42,8 @@ def fetch_page(url: str) -> str:
     normalized_url = url.strip()
     if not normalized_url.lower().startswith(("http://", "https://")):
         return "FETCH_PAGE_INVALID_URL: provide a full http(s) URL, not a search query."
+    if _targets_private_network(normalized_url):
+        return "FETCH_PAGE_BLOCKED: this URL targets a private, local, or reserved network address."
 
     headers = {"X-Return-Format": "markdown"}
     api_key = os.getenv("JINA_API_KEY", "").strip()

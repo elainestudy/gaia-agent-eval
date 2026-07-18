@@ -23,5 +23,6 @@ LOCAL_WORKFLOW.md
 .DS_Store
 
 # Claude Code local settings (settings.json is shared, tracked in git)
-.claude/settings.local.json
+.claude/*
+!.claude/settings.json
 
