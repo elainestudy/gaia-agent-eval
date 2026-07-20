@@ -280,7 +280,7 @@ def run_agent(
                 )
             )
 
-        if step >= 5:
+        if 5 <= step < max_steps:
             messages.append(HumanMessage(content=FINALIZE_PROMPT))
 
     logging.warning("[agent] max_steps exhausted; returning a tool-free best-effort fallback answer")
