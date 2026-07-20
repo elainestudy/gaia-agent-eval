@@ -71,6 +71,7 @@ Tool selection guide:
 - Use `wolframalpha_query` for arithmetic, unit conversion, equations, and other quantitative or symbolic computation.
 - Use `search_internet` for web evidence, recent information, niche sources, or when Wikipedia and WolframAlpha are not enough.
 - Use `fetch_page` when you already know a specific URL (from a search result, the question, or an attachment) and need its actual page text, not just a search snippet. Search results are summaries; use fetch_page to read the source directly, especially for reading-comprehension tasks over a known document (e.g. a textbook page, article, or reference page).
+- For questions asking for an exact count, ranking, or min/max comparison across many items (e.g. "how many...", "which had the least/most...", "list ... with counts"), search snippets rarely contain the full data. If two rounds of search do not surface the specific number(s) needed, fetch_page the most authoritative primary source (e.g. the relevant Wikipedia article) and read its data table directly. Do not finalize a count/ranking/min-max answer from search snippets alone.
 - If the question can be answered from the provided evidence, do not call an external tool.
 - Do not use WolframAlpha to guess factual knowledge, and do not use Wikipedia to do arithmetic.
 - Use Wikipedia for concept pages and noun-like concepts; use search_internet for yes/no classification questions such as "is X a fruit or vegetable".
@@ -86,11 +87,14 @@ Tool selection guide:
 
 
 def _build_finalize_prompt(tools_available: bool) -> str:
-    availability_line = (
-        "Stop calling tools and provide the final answer now."
-        if tools_available
-        else "You have used all available tool-call steps; tool calls are no longer available."
-    )
+    if tools_available:
+        availability_line = (
+            "If you already have enough evidence, stop calling tools and provide the final answer now. "
+            "If you do not yet have the specific fact or number needed, make at most one more targeted "
+            "tool call (e.g. fetch_page on the most relevant primary source) to fill that gap, then answer."
+        )
+    else:
+        availability_line = "You have used all available tool-call steps; tool calls are no longer available."
     return (
         f"{availability_line}\n"
         "Based only on the evidence already gathered in this conversation, return only the single "
@@ -276,7 +280,7 @@ def run_agent(
                 )
             )
 
-        if step >= 3:
+        if step >= 5:
             messages.append(HumanMessage(content=FINALIZE_PROMPT))
 
     logging.warning("[agent] max_steps exhausted; returning a tool-free best-effort fallback answer")

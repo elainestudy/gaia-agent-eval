@@ -75,7 +75,7 @@ def fetch_page(url: str) -> str:
                 "and the fetched text is navigation/config, not the actual article body. "
                 "Try search_internet to find a cached or mirrored copy of this page's content instead."
             )
-        # Inline image markdown (long CDN URLs) is pure noise for a text QA tool and
+        # Inline image Markdown (long CDN URLs) is pure noise for a text QA tool and
         # eats into the truncation budget before real content is reached.
         text = IMAGE_MARKDOWN_PATTERN.sub("", text)
         if len(text) > MAX_RESPONSE_CHARS:
