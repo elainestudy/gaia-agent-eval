@@ -19,6 +19,13 @@ LOCAL_WORKFLOW.md
 # Local video cache
 .cache/
 
+# GAIA files downloaded via the /files/{task_id} 404 fallback (see tools/file_router.py)
+.local_attachments/
+
+# Generated answer files (task_id -> answer) are effectively an answer key for this
+# course's graded assessment; never publish these.
+*.jsonl
+
 # macOS
 .DS_Store
 

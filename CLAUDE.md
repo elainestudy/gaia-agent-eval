@@ -8,11 +8,12 @@ An agent that answers **GAIA benchmark** questions for the Hugging Face "AI Agen
 
 ## Environment & running
 
-No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `python-dotenv`, `requests`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
+No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `huggingface_hub`, `python-dotenv`, `requests`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
 
 Requires a `.env` file with:
 - `GOOGLE_API_KEY` — required, Gemini access for `agent.py`
 - `WOLFRAMALPHA_APP_ID` — optional; without it `wolframalpha_query` just returns `WOLFRAMALPHA_NOT_CONFIGURED`
+- `HF_TOKEN` — optional but needed for the `/files/{task_id}` 404 workaround below to actually fetch anything; a read-only token is enough, and you must have accepted access to the gated `gaia-benchmark/GAIA` dataset on huggingface.co first
 
 `yt-dlp` must be on `PATH` for the local video-analysis flow, and a local **Ollama** server (`localhost:11434`, model `minicpm-v:8b`) must be running for image/video frame captioning.
 
@@ -32,6 +33,11 @@ python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --agent-p
 
 # Replay a specific task instead of a random one (works with test-one via code, or submit-one via flag)
 python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --task-id <task_id>
+
+# Submit every answer already saved in the JSONL output file in one shot (this is
+# what actually updates the leaderboard score — submit-one only ever scores out of
+# 20 for a single question, so it can never move the real record)
+python3 eval_pipeline.py --mode submit-all --username YOUR_HF_USERNAME
 
 # Manually pull a low-res video into the local cache for the video-analysis flow
 yt-dlp -f "worstvideo" -o ".cache/video/%(id)s/%(id)s.%(ext)s" "<youtube_url>"
@@ -55,9 +61,18 @@ yt-dlp -f "worstvideo" -o ".cache/video/%(id)s/%(id)s.%(ext)s" "<youtube_url>"
 - `get_youtube_transcript.py` — extracts subtitles via `youtube_transcript_api`; returns `NO_TRANSCRIPT_AVAILABLE` on any failure rather than raising, so the agent can fall back to other tools.
 - `video_local.py` — for YouTube videos with no usable transcript: downloads a low-res copy with `yt-dlp`, samples frames, and captions them via a **local Ollama vision model** (`ollama_chat_with_image`, default `minicpm-v:8b`), building a "video state report" (e.g. tracking entity counts/species over time). Reports are cached under `.cache/video/<task_id>/` and reused on rerun.
 - `file_router.py` — routes task attachments by detected type (text/image/video/pdf via extension or byte sniffing) and builds evidence text accordingly; images/video frames go through the same local vision model as `video_local.py`. Caches under `.cache/attachments/<task_id>/`.
+- `fetch_page.py` — fetches a known URL's actual page text via Jina Reader (`r.jina.ai`), for reading-comprehension tasks where a search snippet isn't enough. Blocks requests to private/local network addresses, and gives Wikipedia pages a larger truncation budget plus a `X-Target-Selector` header so nav/language-switcher chrome doesn't crowd out the real article body.
+
+## Known upstream issue: `/files/{task_id}` 404s for tasks that do have a file
+
+This is a real, still-open bug in the course's scoring API, not something in this repo:  `GET /files/{task_id}` returns 404 (`"No file path associated with task_id ..."`) for every task whose `file_name` field is non-empty, i.e. attachments are effectively unfetchable through the intended endpoint. Tracked at [huggingface/agents-course#647](https://github.com/huggingface/agents-course/issues/647), root-caused on the [HF forum](https://discuss.huggingface.co/t/get-files-task-id-returning-404-for-every-task-id-with-file-name/170575) as a relative-vs-absolute path bug in the Space's own file-serving code.
+
+**Workaround, not a fix** (the actual bug lives in HF's Space and isn't something this repo can patch): `tools/file_router.py`'s `download_attachment()` falls back to fetching the file directly from the `gaia-benchmark/GAIA` dataset on the Hub (trying the `validation` split first, then `test`) whenever `/files/{task_id}` 404s, and caches the result under `.local_attachments/<task_id>/` so later runs don't hit the Hub again. This needs `HF_TOKEN` set and access to the gated dataset already granted; without either, attachment-bearing tasks just silently fall back to no evidence, same as before this workaround existed.
+
+Audio (`.mp3`) and spreadsheet (`.xlsx`) attachments still aren't parsed once fetched — `detect_file_type`/`build_attachment_evidence` in `file_router.py` only handle text/image/pdf today, so those file types return `UNSUPPORTED_FILE_TYPE` even when the download itself succeeds. That's a separate, unimplemented gap, not part of this workaround.
 
 ## Notes carried over from local dev workflow
 
 - `search_wikipedia` is for definitions/concept disambiguation; `wolframalpha_query` needs `WOLFRAMALPHA_APP_ID` to do anything.
-- If a task has an attachment, the pipeline tries `/files/{task_id}` and appends parsed content to the prompt automatically — no manual step needed.
+- If a task has an attachment, the pipeline tries `/files/{task_id}` first, then the Hub fallback above, and appends parsed content to the prompt automatically — no manual step needed.
 - Numeric answers should stay short and bare; the cleaning step in `eval_pipeline.py` depends on this.

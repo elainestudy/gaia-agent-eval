@@ -4,30 +4,26 @@ An agent that answers questions from the [GAIA benchmark](https://huggingface.co
 
 ## Architecture
 
-- **`agent.py`** — the agent core. A LangChain tool-calling loop around Gemini, bound to four tools (`search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`). The system prompt enforces a strict **observe → classify → knowledge-lookup** workflow, designed to avoid two common failure modes: treating atypical category members incorrectly (e.g. a penguin is still a bird), and letting one broad search stand in for checking every item in a candidate list individually.
+- **`agent.py`** — the agent core. A LangChain tool-calling loop around Gemini, bound to five tools (`search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`, `fetch_page`). The system prompt enforces a strict **observe → classify → knowledge-lookup** workflow, designed to avoid two common failure modes: treating atypical category members incorrectly (e.g. a penguin is still a bird), and letting one broad search stand in for checking every item in a candidate list individually.
 - **`eval_pipeline.py`** — the evaluation harness. Fetches GAIA questions from the scoring API, assembles evidence (question text, parsed attachments, local video analysis), runs the agent, cleans the output to match GAIA's exact-match formatting rules, and (optionally) submits answers to the scoring API.
 - **`tools/`** — each tool is a standalone function with its own guard logic:
   - `search.py` / `search_wikipedia.py` — web and Wikipedia search; both detect multi-item list queries and refuse/narrow them to a single candidate rather than letting the agent try to resolve a whole list in one call.
   - `wolframalpha_query.py` — thin wrapper over the WolframAlpha API for arithmetic/unit/equation queries.
   - `get_youtube_transcript.py` — pulls YouTube subtitles, falling back gracefully when none exist.
   - `video_local.py` — for videos with no transcript: downloads a low-res copy, samples frames, and captions them with a local Ollama vision model to build a "video state report."
-  - `file_router.py` — routes task attachments (text/image/video/pdf) and builds evidence text from them, reusing the same local vision model for images.
+  - `file_router.py` — routes task attachments (text/image/video/pdf) and builds evidence text from them, reusing the same local vision model for images. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
+  - `fetch_page.py` — fetches a known URL's actual page text (via Jina Reader) for reading-comprehension tasks where a search snippet isn't specific enough.
 
 ## Setup
 
-Requires Python 3.13.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+Requires Python 3.13. There's no `requirements.txt` — dependencies live only in the checked-in `.venv`; activate it or use `.venv/bin/python3` / `.venv/bin/pip` directly.
 
 Create a `.env` file in the project root:
 
 ```
 GOOGLE_API_KEY=your_gemini_api_key       # required
 WOLFRAMALPHA_APP_ID=your_wolframalpha_id # optional — without it, wolframalpha_query returns WOLFRAMALPHA_NOT_CONFIGURED
+HF_TOKEN=your_hf_token                   # optional, read-only is enough — needed for the /files 404 workaround below
 ```
 
 Additional runtime dependencies:
@@ -48,6 +44,25 @@ python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --agent-p
 
 # Replay a specific task instead of a random one
 python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --task-id <task_id>
+
+# Submit every answer already saved in the JSONL file in one shot — this is the mode
+# that actually updates the leaderboard score; submit-one always scores out of 20 for
+# just the single question it sent, so it can never move the real record
+python3 eval_pipeline.py --mode submit-all --username YOUR_HF_USERNAME
 ```
 
 `build-jsonl` and `submit-one` skip/resume already-completed `task_id`s found in the output file, so re-running `build-jsonl` is safe.
+
+## Known issues
+
+### `GET /files/{task_id}` 404s for tasks that do have a file
+
+This is a bug in the course's own scoring API, not in this repo — tracked in [huggingface/agents-course#647](https://github.com/huggingface/agents-course/issues/647) and root-caused on the [HF forum](https://discuss.huggingface.co/t/get-files-task-id-returning-404-for-every-task-id-with-file-name/170575) as a relative-vs-absolute path bug in the Space's file-serving code. Every task whose `file_name` field is non-empty currently gets `404 {"detail": "No file path associated with task_id ..."}` from the intended endpoint, making its attachment unfetchable through the documented path.
+
+**Workaround** (not a fix — the actual bug lives in HF's infrastructure): `tools/file_router.py` falls back to fetching the file directly from the `gaia-benchmark/GAIA` dataset on the Hugging Face Hub (checking the `validation` split, then `test`) whenever `/files/{task_id}` 404s, and caches the result locally under `.local_attachments/<task_id>/` so it's only fetched once. This needs:
+1. `HF_TOKEN` set in `.env` (a read-only token is enough), and
+2. Access already granted to the gated [`gaia-benchmark/GAIA`](https://huggingface.co/datasets/gaia-benchmark/GAIA) dataset on huggingface.co.
+
+Without either, attachment-bearing tasks whose files 404 just silently fall back to no evidence, same as before this workaround existed.
+
+**Still unimplemented**: even once fetched, audio (`.mp3`) and spreadsheet (`.xlsx`) attachments aren't parsed — `file_router.py` only builds real evidence for text/image/pdf today. That's a separate gap, not something this workaround addresses.

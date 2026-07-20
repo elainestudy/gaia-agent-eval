@@ -1,14 +1,25 @@
 import json
 import mimetypes
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from huggingface_hub import hf_hub_download
 
 from tools.video_local import DEFAULT_VISION_MODEL, ollama_chat_with_image
 
 ATTACHMENT_CACHE_DIR = Path(".cache/attachments")
+# agents-course-unit4-scoring.hf.space/files/{task_id} 404s for tasks that do have a
+# file (known upstream bug: https://discuss.huggingface.co/t/get-files-task-id-returning-404-for-every-task-id-with-file-name/170575).
+# When that happens, fall back to fetching the file directly from the dataset on the
+# Hub and cache it here instead, so re-runs don't need the Hub at all.
+LOCAL_ATTACHMENTS_DIR = Path(".local_attachments")
+GAIA_DATASET_REPO = "gaia-benchmark/GAIA"
+# The course's task set draws from the validation split (it needs public ground truth
+# to score), but try test too in case a future task set includes one of those files.
+GAIA_DATASET_SPLIT_PREFIXES = ("2023/validation", "2023/test")
 VideoLogger = Callable[[str], None]
 
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".html", ".htm", ".log"}
@@ -106,9 +117,59 @@ def save_attachment_response(task_id: str, response: requests.Response) -> Path:
     return file_path
 
 
-def download_attachment(task_id: str, api_base: str, emit: VideoLogger | None = None) -> tuple[Path | None, str | None]:
+def _local_attachment_cache_path(task_id: str, file_name: str) -> Path:
+    task_dir = LOCAL_ATTACHMENTS_DIR / re.sub(r"[^0-9A-Za-z_-]+", "_", task_id)
+    return task_dir / file_name
+
+
+def _download_from_hub_fallback(task_id: str, file_name: str, emit: VideoLogger | None = None) -> Path | None:
+    token = os.getenv("HF_TOKEN")
+    downloaded_path = None
+    last_error: Exception | None = None
+    for split_prefix in GAIA_DATASET_SPLIT_PREFIXES:
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=GAIA_DATASET_REPO,
+                filename=f"{split_prefix}/{file_name}",
+                repo_type="dataset",
+                token=token,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+
+    if downloaded_path is None:
+        if emit:
+            emit(f"[file-router] Hub fallback failed for {file_name}: {last_error}")
+        return None
+
+    dest_file = _local_attachment_cache_path(task_id, file_name)
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    dest_file.write_bytes(Path(downloaded_path).read_bytes())
+    if emit:
+        emit(f"[file-router] downloaded attachment via Hub fallback: {dest_file}")
+    return dest_file
+
+
+def download_attachment(
+    task_id: str,
+    api_base: str,
+    emit: VideoLogger | None = None,
+    file_name: str | None = None,
+) -> tuple[Path | None, str | None]:
+    if file_name:
+        cached_path = _local_attachment_cache_path(task_id, file_name)
+        if cached_path.exists():
+            if emit:
+                emit(f"[file-router] using locally cached attachment: {cached_path}")
+            return cached_path, mimetypes.guess_type(str(cached_path))[0]
+
     response = requests.get(f"{api_base}/files/{task_id}", timeout=120)
     if response.status_code == 404:
+        if file_name:
+            fallback_path = _download_from_hub_fallback(task_id, file_name, emit=emit)
+            if fallback_path:
+                return fallback_path, mimetypes.guess_type(str(fallback_path))[0]
         return None, None
 
     response.raise_for_status()
@@ -201,8 +262,11 @@ def build_attachment_evidence(
     task_id: str,
     question_text: str,
     emit: VideoLogger | None = None,
+    file_name: str | None = None,
 ) -> str:
-    attachment_path, content_type = download_attachment(task_id=task_id, api_base=api_base, emit=emit)
+    attachment_path, content_type = download_attachment(
+        task_id=task_id, api_base=api_base, emit=emit, file_name=file_name
+    )
     if attachment_path is None:
         return "Attachment evidence: none."
 
