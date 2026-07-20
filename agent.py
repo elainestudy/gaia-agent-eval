@@ -179,6 +179,7 @@ def build_agent_prompt(
         "- Use evidence first.\n"
         "- If a category is ambiguous, look it up instead of guessing.\n"
         "- Return the shortest answer that is still evidence-based.\n"
+        "- Return only the bare answer itself, no attribution, explanation, or restating the question.\n"
         "- For comma-separated list answers, preserve the exact source item strings in the final response.\n"
         "- For candidate-list questions, ensure every source item was considered before finalizing the answer.\n"
         "- Before finalizing any candidate-list answer, mentally check that no source item was skipped and no generic search replaced item-by-item classification.\n"
