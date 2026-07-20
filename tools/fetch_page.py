@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import socket
 from urllib.parse import urlparse
 
@@ -9,10 +10,15 @@ import requests
 from langchain_core.tools import tool
 
 JINA_READER_BASE = "https://r.jina.ai/"
-MAX_RESPONSE_CHARS = 10000
+# Wikipedia's nav chrome and interlanguage link list alone can run past 60k characters
+# before the article body even starts, so the budget has to be generous enough to
+# actually reach real content on long articles.
+MAX_RESPONSE_CHARS = 50000
 # Highly distinctive MindTouch/Jina error signature (a raw C# reflection type name) —
 # unlike a generic phrase, this essentially never appears in legitimate page content.
 DYNAMIC_RENDER_MARKERS = ("property get [Map MindTouch",)
+IMAGE_MARKDOWN_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+WIKIPEDIA_CONTENT_SELECTOR = "#mw-content-text"
 
 
 def _targets_private_network(url: str) -> bool:
@@ -49,6 +55,9 @@ def fetch_page(url: str) -> str:
     api_key = os.getenv("JINA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    hostname = urlparse(normalized_url).hostname or ""
+    if hostname.endswith("wikipedia.org"):
+        headers["X-Target-Selector"] = WIKIPEDIA_CONTENT_SELECTOR
 
     try:
         response = requests.get(
@@ -66,6 +75,9 @@ def fetch_page(url: str) -> str:
                 "and the fetched text is navigation/config, not the actual article body. "
                 "Try search_internet to find a cached or mirrored copy of this page's content instead."
             )
+        # Inline image markdown (long CDN URLs) is pure noise for a text QA tool and
+        # eats into the truncation budget before real content is reached.
+        text = IMAGE_MARKDOWN_PATTERN.sub("", text)
         if len(text) > MAX_RESPONSE_CHARS:
             text = text[:MAX_RESPONSE_CHARS] + "\n\n[TRUNCATED: page content exceeds character limit]"
         return text
