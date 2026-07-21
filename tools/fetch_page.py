@@ -20,11 +20,29 @@ WIKIPEDIA_MAX_RESPONSE_CHARS = 50000
 DYNAMIC_RENDER_MARKERS = ("property get [Map MindTouch",)
 # Keep the alt text (it can carry real information) but drop the noisy CDN URL.
 IMAGE_MARKDOWN_PATTERN = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+# MindTouch injects the same block of dozens of LaTeX \newcommand macros into every
+# page's math rendering setup, regardless of the article's actual content -- pure
+# boilerplate that eats into the truncation budget before real content appears.
+LATEX_MACRO_LINE_PATTERN = re.compile(r"\\(?:newcommand|renewcommand|definecolor)\{")
 WIKIPEDIA_CONTENT_SELECTOR = "#mw-content-text"
+# LibreTexts runs on MindTouch, which renders its real content client-side behind
+# navigation/config chrome, same problem Wikipedia has. MindTouch pages carry a
+# "skip to main content" accessibility link pointing at this anchor.
+LIBRETEXTS_CONTENT_SELECTOR = "#elm-main-content"
 
 
 def _is_wikipedia_hostname(hostname: str) -> bool:
     return hostname == "wikipedia.org" or hostname.endswith(".wikipedia.org")
+
+
+def _is_libretexts_hostname(hostname: str) -> bool:
+    return hostname.endswith(".libretexts.org")
+
+
+def _strip_latex_macro_boilerplate(text: str) -> str:
+    lines = [line for line in text.split("\n") if not LATEX_MACRO_LINE_PATTERN.search(line)]
+    cleaned = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
 def _targets_private_network(hostname: str) -> bool:
@@ -65,6 +83,8 @@ def fetch_page(url: str) -> str:
         headers["Authorization"] = f"Bearer {api_key}"
     if is_wikipedia:
         headers["X-Target-Selector"] = WIKIPEDIA_CONTENT_SELECTOR
+    elif _is_libretexts_hostname(hostname):
+        headers["X-Target-Selector"] = LIBRETEXTS_CONTENT_SELECTOR
 
     try:
         response = requests.get(
@@ -85,6 +105,7 @@ def fetch_page(url: str) -> str:
         # Inline image URLs (long CDN links) are pure noise for a text QA tool and eat
         # into the truncation budget before real content is reached; keep the alt text.
         text = IMAGE_MARKDOWN_PATTERN.sub(r"\1", text)
+        text = _strip_latex_macro_boilerplate(text)
         max_chars = WIKIPEDIA_MAX_RESPONSE_CHARS if is_wikipedia else DEFAULT_MAX_RESPONSE_CHARS
         if len(text) > max_chars:
             text = text[:max_chars] + "\n\n[TRUNCATED: page content exceeds character limit]"
