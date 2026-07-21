@@ -188,6 +188,7 @@ def build_agent_prompt(
         "- For candidate-list questions, ensure every source item was considered before finalizing the answer.\n"
         "- Before finalizing any candidate-list answer, mentally check that no source item was skipped and no generic search replaced item-by-item classification.\n"
         "- If the full candidate list is already in the prompt, prefer classifying the provided items directly over any broad search.\n"
+        "- Build the full candidate set from evidence actually gathered in this conversation, not from memory -- do not silently drop or approximate items when transcribing a list into notes or code. When classifying candidates against a historical or time-sensitive fact (e.g. whether a country, organization, or entity associated with a candidate still exists), verify each candidate individually against a primary source. Do not accept a single search result's stated overall conclusion as a substitute for that verification, especially from an answer-aggregator or Q&A site.\n"
         "- Search evidence should support the current item directly; related concepts are not enough to exclude or include an item by themselves."
     )
     return "\n\n".join(sections)
