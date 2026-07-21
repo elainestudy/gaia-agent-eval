@@ -74,6 +74,7 @@ Tool selection guide:
 - Use `search_internet` for web evidence, recent information, niche sources, or when Wikipedia and WolframAlpha are not enough.
 - Use `fetch_page` when you already know a specific URL (from a search result, the question, or an attachment) and need its actual page text, not just a search snippet. Search results are summaries; use fetch_page to read the source directly, especially for reading-comprehension tasks over a known document (e.g. a textbook page, article, or reference page).
 - For questions that need one specific fact from a structured data source (a count, ranking, roster/database entry, table lookup, or similar precise record -- e.g. "how many...", "which had the least/most...", "what number is assigned to...", "who holds position X in Y"), search snippets rarely state it directly or completely. If two rounds of search do not surface the exact fact needed, fetch_page the most authoritative primary source (the official site, database, or reference page mentioned in a search result -- not just the top general search hit) and read its actual data directly. Do not finalize such an answer from search snippets alone, and do not keep rewording the same search query instead of switching to fetch_page.
+- If a question asks about a state "as of" a specific past date (a roster, a price, an article's contents, or anything else that changes over time), a live/current page only tells you today's state, not the state on that date -- do not treat it as equivalent. Instead fetch_page a Wayback Machine snapshot from around that date: https://web.archive.org/web/YYYYMMDD000000/<the original URL>. The Wayback Machine resolves to the closest available snapshot even if that exact date wasn't archived, but it does not fuzzy-match the URL itself -- <the original URL> must be copied exactly from a page you already fetched or a search result, never guessed or reconstructed from memory.
 - If the question can be answered from the provided evidence, do not call an external tool.
 - Do not use WolframAlpha to guess factual knowledge, and do not use Wikipedia to do arithmetic.
 - Use Wikipedia for concept pages and noun-like concepts; use search_internet for yes/no classification questions such as "is X a fruit or vegetable".
@@ -235,6 +236,7 @@ def run_agent(
     ]
     seen_calls: set[tuple[str, str]] = set()
     recent_queries: dict[str, list[str]] = {}
+    near_duplicate_block_counts: dict[str, int] = {}
 
     _debug_print(verbose, f"[agent] question: {question}")
 
@@ -266,11 +268,20 @@ def run_agent(
                     "a final answer. Do not repeat it; use a different query, URL, or tool instead."
                 )
             elif _is_near_duplicate_query(tool_name, tool_call["args"], recent_queries):
-                tool_output = (
-                    "ALREADY_TRIED: a very similar query was already made earlier and did not lead to "
-                    "a final answer. Do not just reword it; use a substantially different query, URL, or "
-                    "tool instead."
-                )
+                near_duplicate_block_counts[tool_name] = near_duplicate_block_counts.get(tool_name, 0) + 1
+                if tool_name == "search_internet" and near_duplicate_block_counts[tool_name] >= 2:
+                    tool_output = (
+                        "ALREADY_TRIED: rewording this search_internet query is still not working -- stop "
+                        "retrying it. You should already have at least one specific URL from an earlier "
+                        "search result or fetch; call fetch_page on that exact URL directly instead of "
+                        "searching again."
+                    )
+                else:
+                    tool_output = (
+                        "ALREADY_TRIED: a very similar query was already made earlier and did not lead to "
+                        "a final answer. Do not just reword it; use a substantially different query, URL, or "
+                        "tool instead."
+                    )
             else:
                 tool_output = tool.invoke(tool_call["args"])
                 if not _is_transient_failure(tool_output):
