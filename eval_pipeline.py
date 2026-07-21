@@ -219,6 +219,8 @@ NUMERIC_QUESTION_HINTS = (
     "what number",
     "what is the total",
     "total number",
+    "the total",
+    "total sales",
     "highest number",
     "lowest number",
     "count",

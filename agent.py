@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from tools.fetch_page import fetch_page
 from tools.get_youtube_transcript import get_youtube_transcript
+from tools.run_code import run_python_code
 from tools.search import search_internet
 from tools.search_wikipedia import search_wikipedia
 from tools.wolframalpha_query import wolframalpha_query
@@ -24,7 +25,7 @@ if not api_key:
 # Initialize the model using the stable identifier
 llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite")
 
-tools = [search_internet, search_wikipedia, wolframalpha_query, get_youtube_transcript, fetch_page]
+tools = [search_internet, search_wikipedia, wolframalpha_query, get_youtube_transcript, fetch_page, run_python_code]
 llm_with_tools = llm.bind_tools(tools)
 tool_registry = {tool.name: tool for tool in tools}
 SYSTEM_PROMPT = """
@@ -68,10 +69,11 @@ Search to clarify classification, not to replace observation.
 TOOL_SELECTION_PROMPT_TEMPLATE = """
 Tool selection guide:
 - Use `search_wikipedia` for stable definitions, taxonomy, category membership, and conceptual clarification.
-- Use `wolframalpha_query` for arithmetic, unit conversion, equations, and other quantitative or symbolic computation.
+- Use `wolframalpha_query` for simple, single-expression arithmetic, unit conversion, equations, and other quantitative or symbolic computation.
+- Use `run_python_code` instead of wolframalpha_query or mental math whenever a calculation has many terms (e.g. summing a long list of numbers from a table), or whenever you need to actually execute an attached/referenced piece of code to determine its real output rather than tracing through it by hand. If wolframalpha_query fails to parse a query (e.g. "did not understand your input"), do not keep retrying it or rewording it — switch to run_python_code and write the equivalent calculation as code instead.
 - Use `search_internet` for web evidence, recent information, niche sources, or when Wikipedia and WolframAlpha are not enough.
 - Use `fetch_page` when you already know a specific URL (from a search result, the question, or an attachment) and need its actual page text, not just a search snippet. Search results are summaries; use fetch_page to read the source directly, especially for reading-comprehension tasks over a known document (e.g. a textbook page, article, or reference page).
-- For questions asking for an exact count, ranking, or min/max comparison across many items (e.g. "how many...", "which had the least/most...", "list ... with counts"), search snippets rarely contain the full data. If two rounds of search do not surface the specific number(s) needed, fetch_page the most authoritative primary source (e.g. the relevant Wikipedia article) and read its data table directly. Do not finalize a count/ranking/min-max answer from search snippets alone.
+- For questions that need one specific fact from a structured data source (a count, ranking, roster/database entry, table lookup, or similar precise record -- e.g. "how many...", "which had the least/most...", "what number is assigned to...", "who holds position X in Y"), search snippets rarely state it directly or completely. If two rounds of search do not surface the exact fact needed, fetch_page the most authoritative primary source (the official site, database, or reference page mentioned in a search result -- not just the top general search hit) and read its actual data directly. Do not finalize such an answer from search snippets alone, and do not keep rewording the same search query instead of switching to fetch_page.
 - If the question can be answered from the provided evidence, do not call an external tool.
 - Do not use WolframAlpha to guess factual knowledge, and do not use Wikipedia to do arithmetic.
 - Use Wikipedia for concept pages and noun-like concepts; use search_internet for yes/no classification questions such as "is X a fruit or vegetable".
@@ -180,6 +182,8 @@ def build_agent_prompt(
         "- If a category is ambiguous, look it up instead of guessing.\n"
         "- Return the shortest answer that is still evidence-based.\n"
         "- Return only the bare answer itself, no attribution, explanation, or restating the question.\n"
+        "- When a question's worked example demonstrates stripping only quantities/measurements (e.g. \"three of\", \"a dozen\") from list items, strip only numbers, units, and vague amount words. Do not also strip words describing how something was made, sourced, or processed (e.g. \"hand-picked\", \"slow-roasted\", \"pre-washed\") — those describe the item itself, not its quantity, and must stay even though the example doesn't call them out explicitly. Before finalizing, re-check each item you modified: if what you removed was not a number, unit, or amount word, put it back.\n"
+        "- When a question asks to include one category of items/columns and exclude another (e.g. \"total from X, not including Y\"), classify every individual item against the actual excluded category by its own meaning, one at a time. Do not exclude an item just because it is adjacent to, listed near, or grouped together with items that are genuinely excluded — proximity or list position is not evidence of category membership. Before finalizing, re-check every item you excluded: state why it specifically belongs to the excluded category, not merely why it seems different from the included ones.\n"
         "- For comma-separated list answers, preserve the exact source item strings in the final response.\n"
         "- For candidate-list questions, ensure every source item was considered before finalizing the answer.\n"
         "- Before finalizing any candidate-list answer, mentally check that no source item was skipped and no generic search replaced item-by-item classification.\n"
