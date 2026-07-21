@@ -25,6 +25,9 @@ VideoLogger = Callable[[str], None]
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".html", ".htm", ".log"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xls"}
+WHISPER_MODEL_SIZE = "base"
 
 AMBIGUITY_HINTS = (
     (r"\bbird\b", r"\bpenguin(s)?\b", "Penguins count as birds for bird-species questions."),
@@ -57,6 +60,10 @@ def detect_file_type(file_path: Path, content_type: str | None = None) -> str:
         return "image"
     if suffix in VIDEO_EXTENSIONS:
         return "video"
+    if suffix in AUDIO_EXTENSIONS:
+        return "audio"
+    if suffix in SPREADSHEET_EXTENSIONS:
+        return "spreadsheet"
     if suffix == ".pdf":
         return "pdf"
 
@@ -223,6 +230,53 @@ def ocr_or_vision_for_visual_content(
     return ollama_chat_with_image(model=model, prompt=prompt, image_path=file_path, emit=emit)
 
 
+_whisper_model_cache: dict[str, Any] = {}
+
+
+def _get_whisper_model(model_size: str = WHISPER_MODEL_SIZE) -> Any:
+    if model_size not in _whisper_model_cache:
+        from faster_whisper import WhisperModel
+
+        _whisper_model_cache[model_size] = WhisperModel(model_size, device="cpu", compute_type="int8")
+    return _whisper_model_cache[model_size]
+
+
+def transcribe_audio_content(file_path: Path, emit: VideoLogger | None = None) -> str:
+    if file_path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return f"AUDIO_TRANSCRIPTION_UNAVAILABLE: unsupported audio file type {file_path.suffix or '<none>'}."
+
+    try:
+        model = _get_whisper_model()
+        if emit:
+            emit(f"[file-router] transcribing {file_path.name} with local Whisper ({WHISPER_MODEL_SIZE})")
+        segments, _info = model.transcribe(str(file_path))
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+    except Exception as exc:
+        return f"UNSUPPORTED_AUDIO_EXTRACTION: failed to transcribe {file_path.name}: {exc}"
+
+    if not text:
+        return "NO_TRANSCRIPT_AVAILABLE: audio transcription produced no text."
+    return text
+
+
+def parse_spreadsheet_content(file_path: Path) -> str:
+    if file_path.suffix.lower() not in SPREADSHEET_EXTENSIONS:
+        return f"SPREADSHEET_PARSE_UNAVAILABLE: unsupported spreadsheet file type {file_path.suffix or '<none>'}."
+
+    try:
+        import pandas as pd
+
+        sheets = pd.read_excel(file_path, sheet_name=None)
+    except Exception as exc:
+        return f"UNSUPPORTED_SPREADSHEET_EXTRACTION: failed to parse {file_path.name}: {exc}"
+
+    parts: list[str] = []
+    for sheet_name, dataframe in sheets.items():
+        parts.append(f"Sheet: {sheet_name}")
+        parts.append(dataframe.to_csv(index=False))
+    return "\n\n".join(parts).strip()
+
+
 def normalize_entities(raw_text: str) -> str:
     lines = [line.strip() for line in raw_text.splitlines()]
     collapsed_lines: list[str] = []
@@ -278,6 +332,10 @@ def build_attachment_evidence(
         raw_content = parse_textual_content(attachment_path)
     elif file_type == "image":
         raw_content = ocr_or_vision_for_visual_content(attachment_path, emit=emit)
+    elif file_type == "audio":
+        raw_content = transcribe_audio_content(attachment_path, emit=emit)
+    elif file_type == "spreadsheet":
+        raw_content = parse_spreadsheet_content(attachment_path)
     elif file_type == "pdf":
         raw_content = "UNSUPPORTED_FILE_TYPE: PDF attachment detected, but no local PDF text/vision extractor is configured."
     else:

@@ -8,7 +8,7 @@ An agent that answers **GAIA benchmark** questions for the Hugging Face "AI Agen
 
 ## Environment & running
 
-No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `huggingface_hub`, `python-dotenv`, `requests`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
+No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `huggingface_hub`, `pandas`, `openpyxl`, `faster-whisper`, `python-dotenv`, `requests`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
 
 Requires a `.env` file with:
 - `GOOGLE_API_KEY` — required, Gemini access for `agent.py`
@@ -60,7 +60,7 @@ yt-dlp -f "worstvideo" -o ".cache/video/%(id)s/%(id)s.%(ext)s" "<youtube_url>"
 - `wolframalpha_query.py` — thin wrapper over the WolframAlpha `v1/result` API.
 - `get_youtube_transcript.py` — extracts subtitles via `youtube_transcript_api`; returns `NO_TRANSCRIPT_AVAILABLE` on any failure rather than raising, so the agent can fall back to other tools.
 - `video_local.py` — for YouTube videos with no usable transcript: downloads a low-res copy with `yt-dlp`, samples frames, and captions them via a **local Ollama vision model** (`ollama_chat_with_image`, default `minicpm-v:8b`), building a "video state report" (e.g. tracking entity counts/species over time). Reports are cached under `.cache/video/<task_id>/` and reused on rerun.
-- `file_router.py` — routes task attachments by detected type (text/image/video/pdf via extension or byte sniffing) and builds evidence text accordingly; images/video frames go through the same local vision model as `video_local.py`. Caches under `.cache/attachments/<task_id>/`.
+- `file_router.py` — routes task attachments by detected type (text/image/video/audio/spreadsheet/pdf via extension or byte sniffing) and builds evidence text accordingly; images/video frames go through the same local vision model as `video_local.py`, audio is transcribed with a local `faster-whisper` model, spreadsheets are parsed with `pandas`. Caches under `.cache/attachments/<task_id>/` for the official API path, `.local_attachments/<task_id>/` for the Hub-fallback path below.
 - `fetch_page.py` — fetches a known URL's actual page text via Jina Reader (`r.jina.ai`), for reading-comprehension tasks where a search snippet isn't enough. Blocks requests to private/local network addresses, and gives Wikipedia pages a larger truncation budget plus a `X-Target-Selector` header so nav/language-switcher chrome doesn't crowd out the real article body.
 
 ## Known upstream issue: `/files/{task_id}` 404s for tasks that do have a file
@@ -69,7 +69,7 @@ This is a real, still-open bug in the course's scoring API, not something in thi
 
 **Workaround, not a fix** (the actual bug lives in HF's Space and isn't something this repo can patch): `tools/file_router.py`'s `download_attachment()` falls back to fetching the file directly from the `gaia-benchmark/GAIA` dataset on the Hub (trying the `validation` split first, then `test`) whenever `/files/{task_id}` 404s, and caches the result under `.local_attachments/<task_id>/` so later runs don't hit the Hub again. This needs `HF_TOKEN` set and access to the gated dataset already granted; without either, attachment-bearing tasks just silently fall back to no evidence, same as before this workaround existed.
 
-Audio (`.mp3`) and spreadsheet (`.xlsx`) attachments still aren't parsed once fetched — `detect_file_type`/`build_attachment_evidence` in `file_router.py` only handle text/image/pdf today, so those file types return `UNSUPPORTED_FILE_TYPE` even when the download itself succeeds. That's a separate, unimplemented gap, not part of this workaround.
+Audio (`.mp3`/`.wav`/`.m4a`/`.ogg`/`.flac`) is transcribed with a local `faster-whisper` model (`WHISPER_MODEL_SIZE = "base"`, CPU, cached as a module-level singleton so it's only loaded once per process); spreadsheets (`.xlsx`/`.xls`) are read with `pandas.read_excel` and every sheet is serialized to CSV text as evidence. PDF attachments are still unsupported.
 
 ## Notes carried over from local dev workflow
 

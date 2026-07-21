@@ -11,7 +11,7 @@ An agent that answers questions from the [GAIA benchmark](https://huggingface.co
   - `wolframalpha_query.py` — thin wrapper over the WolframAlpha API for arithmetic/unit/equation queries.
   - `get_youtube_transcript.py` — pulls YouTube subtitles, falling back gracefully when none exist.
   - `video_local.py` — for videos with no transcript: downloads a low-res copy, samples frames, and captions them with a local Ollama vision model to build a "video state report."
-  - `file_router.py` — routes task attachments (text/image/video/pdf) and builds evidence text from them, reusing the same local vision model for images. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
+  - `file_router.py` — routes task attachments (text/image/video/audio/spreadsheet) and builds evidence text from them: images/video frames reuse the same local vision model, audio is transcribed with a local `faster-whisper` model, spreadsheets are parsed with `pandas`. PDF is still unsupported. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
   - `fetch_page.py` — fetches a known URL's actual page text (via Jina Reader) for reading-comprehension tasks where a search snippet isn't specific enough.
 
 ## Setup
@@ -65,4 +65,4 @@ This is a bug in the course's own scoring API, not in this repo — tracked in [
 
 Without either, attachment-bearing tasks whose files 404 just silently fall back to no evidence, same as before this workaround existed.
 
-**Still unimplemented**: even once fetched, audio (`.mp3`) and spreadsheet (`.xlsx`) attachments aren't parsed — `file_router.py` only builds real evidence for text/image/pdf today. That's a separate gap, not something this workaround addresses.
+Audio and spreadsheet attachments are now parsed once fetched (local `faster-whisper` transcription, `pandas`-based spreadsheet-to-CSV), so all 5 known-404 tasks in the course's task set now get real evidence instead of a refusal or a guess. PDF attachments are still unsupported.
