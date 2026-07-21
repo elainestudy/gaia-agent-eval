@@ -1,8 +1,11 @@
 from langchain.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.tools import DuckDuckGoSearchResults
 
-# 实例化原始工具
-ddg_search = DuckDuckGoSearchRun()
+# DuckDuckGoSearchRun returns one unstructured text blob where URLs (if present
+# at all) are truncated and disconnected from the snippet they belong to, so the
+# agent has no real URL to hand to fetch_page. DuckDuckGoSearchResults returns
+# structured {title, link, snippet} results with a complete URL per result.
+ddg_search = DuckDuckGoSearchResults(output_format="list", num_results=6)
 
 
 def _looks_like_multi_item_query(query: str) -> bool:
@@ -30,7 +33,9 @@ def _extract_first_candidate_from_broad_query(query: str) -> str | None:
 
 @tool
 def search_internet(query: str) -> str:
-    """当你需要查找实时信息、新闻、汇率、天气或无法直接回答的问题时，使用此工具。"""
+    """Use this for real-time information, news, exchange rates, weather, or anything
+    that cannot be answered directly. Each result includes a full URL -- pass that URL
+    to fetch_page to read the actual page instead of relying on the snippet alone."""
     if _looks_like_multi_item_query(query):
         specific_item = _extract_first_candidate_from_broad_query(query)
         if specific_item:
@@ -41,5 +46,14 @@ def search_internet(query: str) -> str:
                 "Search one specific candidate item at a time instead of querying the whole list."
             )
 
-    result = ddg_search.invoke(query)
-    return result
+    results = ddg_search.invoke(query)
+    if not results:
+        return "NO_RESULTS: the search returned nothing."
+
+    formatted = []
+    for i, item in enumerate(results, start=1):
+        title = item.get("title", "").strip()
+        link = item.get("link", "").strip()
+        snippet = item.get("snippet", "").strip()
+        formatted.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
+    return "\n".join(formatted)
