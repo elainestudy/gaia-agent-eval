@@ -4,9 +4,11 @@ import ipaddress
 import os
 import re
 import socket
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
+from dateutil import parser as date_parser
 from langchain_core.tools import tool
 
 JINA_READER_BASE = "https://r.jina.ai/"
@@ -37,6 +39,61 @@ def _is_wikipedia_hostname(hostname: str) -> bool:
 
 def _is_libretexts_hostname(hostname: str) -> bool:
     return hostname.endswith(".libretexts.org")
+
+
+def _is_wayback_hostname(hostname: str) -> bool:
+    return hostname == "web.archive.org"
+
+
+# Jina exposes a page's publish/update metadata as this header line when the source
+# HTML has it. Many "live state" pages (rosters, dashboards) don't set that metadata at
+# all and instead render today's actual date straight into the visible page text.
+PUBLISHED_TIME_PATTERN = re.compile(r"Published Time:\s*(.+)")
+DATE_BANNER_PATTERN = re.compile(
+    r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+\d{1,2},?\s+\d{4}\b"
+)
+LIVE_PAGE_WARNING_THRESHOLD_DAYS = 2
+
+
+def _detect_page_date(text: str):
+    match = PUBLISHED_TIME_PATTERN.search(text)
+    candidate = match.group(1).strip() if match else None
+    if not candidate:
+        banner_match = DATE_BANNER_PATTERN.search(text)
+        candidate = banner_match.group(0) if banner_match else None
+    if not candidate:
+        return None
+    try:
+        return date_parser.parse(candidate, fuzzy=True).date()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _maybe_prepend_live_page_warning(text: str) -> str:
+    page_date = _detect_page_date(text)
+    if page_date is None:
+        return text
+    days_old = abs((datetime.now(timezone.utc).date() - page_date).days)
+    if days_old > LIVE_PAGE_WARNING_THRESHOLD_DAYS:
+        return text
+    return (
+        f"NOTE: this page is dated {page_date.isoformat()} (today or very recent) -- it "
+        "reflects the page's current live state, not necessarily any earlier point in "
+        "time. If the question asks about a state as of a different, earlier date, fetch "
+        "this URL's Wayback Machine snapshot for that date instead: "
+        "https://web.archive.org/web/YYYYMMDD000000/<this URL>\n\n"
+    ) + text
+
+
+# Jina Reader 403s on web.archive.org (likely bot-blocked), and Wayback snapshots are
+# already static HTML, so fetch them directly instead of routing through Jina.
+def _html_to_text(html: str) -> str:
+    html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
 def _strip_latex_macro_boilerplate(text: str) -> str:
@@ -75,6 +132,29 @@ def fetch_page(url: str) -> str:
     hostname = (urlparse(normalized_url).hostname or "").lower()
     if _targets_private_network(hostname):
         return "FETCH_PAGE_BLOCKED: this URL targets a private, local, or reserved network address."
+
+    if _is_wayback_hostname(hostname):
+        try:
+            response = requests.get(normalized_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            if response.status_code == 404:
+                return (
+                    "FETCH_PAGE_FAILED: no archived snapshot exists for this exact URL path. "
+                    "The Wayback Machine does not fuzzy-match URLs -- it only works if the URL "
+                    "wrapped after /web/YYYYMMDD000000/ is the exact URL of a page you have "
+                    "already fetched or seen in a search result. Do not guess, shorten, or "
+                    "reconstruct a different path; reuse that exact known-working URL."
+                )
+            response.raise_for_status()
+            text = _html_to_text(response.text)
+            if not text:
+                return "FETCH_PAGE_EMPTY: the page returned no readable content."
+            text = _maybe_prepend_live_page_warning(text)
+            if len(text) > DEFAULT_MAX_RESPONSE_CHARS:
+                text = text[:DEFAULT_MAX_RESPONSE_CHARS] + "\n\n[TRUNCATED: page content exceeds character limit]"
+            return text
+        except Exception as exc:
+            return f"FETCH_PAGE_FAILED: {exc}"
+
     is_wikipedia = _is_wikipedia_hostname(hostname)
 
     headers = {"X-Return-Format": "markdown"}
@@ -106,6 +186,7 @@ def fetch_page(url: str) -> str:
         # into the truncation budget before real content is reached; keep the alt text.
         text = IMAGE_MARKDOWN_PATTERN.sub(r"\1", text)
         text = _strip_latex_macro_boilerplate(text)
+        text = _maybe_prepend_live_page_warning(text)
         max_chars = WIKIPEDIA_MAX_RESPONSE_CHARS if is_wikipedia else DEFAULT_MAX_RESPONSE_CHARS
         if len(text) > max_chars:
             text = text[:max_chars] + "\n\n[TRUNCATED: page content exceeds character limit]"
