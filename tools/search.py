@@ -1,3 +1,5 @@
+from urllib.parse import urlparse
+
 from langchain.tools import tool
 from langchain_community.tools import DuckDuckGoSearchResults
 
@@ -6,6 +8,26 @@ from langchain_community.tools import DuckDuckGoSearchResults
 # agent has no real URL to hand to fetch_page. DuckDuckGoSearchResults returns
 # structured {title, link, snippet} results with a complete URL per result.
 ddg_search = DuckDuckGoSearchResults(output_format="list", num_results=6)
+
+# Homework-answer aggregator sites that scrape benchmark questions verbatim and post
+# AI-generated answers of unknown/low quality -- these have shown up confidently
+# stating wrong facts (e.g. a wrong competition year), which actively misleads the
+# agent rather than just being unhelpful noise. Block them outright.
+BLOCKED_SEARCH_DOMAINS = frozenset({
+    "studyx.ai",
+    "coursehero.com",
+    "chegg.com",
+    "quizlet.com",
+    "brainly.com",
+    "numerade.com",
+    "gauthmath.com",
+    "answers.com",
+})
+
+
+def _is_blocked_domain(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(hostname == domain or hostname.endswith("." + domain) for domain in BLOCKED_SEARCH_DOMAINS)
 
 
 def _looks_like_multi_item_query(query: str) -> bool:
@@ -47,6 +69,7 @@ def search_internet(query: str) -> str:
             )
 
     results = ddg_search.invoke(query)
+    results = [item for item in results if not _is_blocked_domain(item.get("link", ""))]
     if not results:
         return "NO_RESULTS: the search returned nothing."
 
