@@ -67,17 +67,23 @@ DATE_BANNER_PATTERN = re.compile(
 LIVE_PAGE_WARNING_THRESHOLD_DAYS = 2
 
 
+MAX_BANNER_LINE_LABEL_CHARS = 30
+
+
 def _is_standalone_banner_line(text: str, start: int, end: int) -> bool:
-    """A page's own "current state" banner (dashboards, rosters) occupies its own line
-    with nothing else on it; body prose that coincidentally contains a full "Weekday,
-    Month Day, Year" string (e.g. discussing a historical event) shares its line with
-    surrounding sentence text. Checking line position rather than a fixed character
-    offset also survives pages with a lot of nav chrome before the real banner."""
+    """A page's own "current state" banner (dashboards, rosters) occupies its own line,
+    at most with a short label like "Last updated:"/"As of"; body prose that
+    coincidentally contains a full "Weekday, Month Day, Year" string (e.g. discussing a
+    historical event) shares its line with a much longer surrounding sentence. Checking
+    line position rather than a fixed character offset also survives pages with a lot of
+    nav chrome before the real banner."""
     line_start = text.rfind("\n", 0, start) + 1
     line_end = text.find("\n", end)
     if line_end == -1:
         line_end = len(text)
-    return text[line_start:line_end].strip() == text[start:end].strip()
+    line = text[line_start:line_end].strip()
+    date_text = text[start:end].strip()
+    return len(line) - len(date_text) <= MAX_BANNER_LINE_LABEL_CHARS
 
 
 def _detect_page_date(text: str):
