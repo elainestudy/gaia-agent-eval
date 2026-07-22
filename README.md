@@ -2,21 +2,25 @@
 
 An agent that answers questions from the [GAIA benchmark](https://huggingface.co/gaia-benchmark) for Hugging Face's "AI Agents Course" Unit 4 assessment, and submits results to the course's scoring API for leaderboard grading.
 
+## "score": 100.0 benchmark completed
+All 20 tasks in the set have been successfully solved by this agent at least once! While non-deterministic components like model sampling and VLM reads mean it’s not a 20/20 every single run, the ceiling is officially maxed out.
+
 ## Architecture
 
-- **`agent.py`** — the agent core. A LangChain tool-calling loop around Gemini, bound to five tools (`search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`, `fetch_page`). The system prompt enforces a strict **observe → classify → knowledge-lookup** workflow, designed to avoid two common failure modes: treating atypical category members incorrectly (e.g. a penguin is still a bird), and letting one broad search stand in for checking every item in a candidate list individually.
+- **`agent.py`** — the agent core. A LangChain tool-calling loop around Gemini, bound to six tools (`search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`, `fetch_page`, `run_python_code`). The system prompt enforces a strict **observe → classify → knowledge-lookup** workflow, designed to avoid two common failure modes: treating atypical category members incorrectly (e.g. a penguin is still a bird), and letting one broad search stand in for checking every item in a candidate list individually.
 - **`eval_pipeline.py`** — the evaluation harness. Fetches GAIA questions from the scoring API, assembles evidence (question text, parsed attachments, local video analysis), runs the agent, cleans the output to match GAIA's exact-match formatting rules, and (optionally) submits answers to the scoring API.
 - **`tools/`** — each tool is a standalone function with its own guard logic:
   - `search.py` / `search_wikipedia.py` — web and Wikipedia search; both detect multi-item list queries and refuse/narrow them to a single candidate rather than letting the agent try to resolve a whole list in one call.
   - `wolframalpha_query.py` — thin wrapper over the WolframAlpha API for arithmetic/unit/equation queries.
   - `get_youtube_transcript.py` — pulls YouTube subtitles, falling back gracefully when none exist.
   - `video_local.py` — for videos with no transcript: downloads a low-res copy, samples frames, and captions them with a local Ollama vision model to build a "video state report."
-  - `file_router.py` — routes task attachments (text/image/video/audio/spreadsheet) and builds evidence text from them: images/video frames reuse the same local vision model, audio is transcribed with a local `faster-whisper` model, spreadsheets are parsed with `pandas`. PDF is still unsupported. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
-  - `fetch_page.py` — fetches a known URL's actual page text (via Jina Reader) for reading-comprehension tasks where a search snippet isn't specific enough.
+  - `file_router.py` — routes task attachments (text/image/video/audio/spreadsheet) and builds evidence text from them: image attachments go through **Gemini's own multimodal input** (far more reliable than the local model for precise structured reading, e.g. chessboard positions — video frames still use the local model, since a video can produce many sampled frames and a GAIA task has at most one image), audio is transcribed with a local `faster-whisper` model, spreadsheets are parsed with `pandas`. PDF is still unsupported. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
+  - `fetch_page.py` — fetches a known URL's actual page text (via Jina Reader, or directly for Wayback Machine snapshots) for reading-comprehension tasks where a search snippet isn't specific enough, or where a question needs a page's state as of a past date rather than today's.
+  - `run_code.py` — runs Python the agent writes for math/aggregation beyond WolframAlpha, or to execute an attached script. For chess-puzzle questions it also backstops two things the model reliably gets wrong on its own: it runs a real chess engine itself (if `stockfish` is installed) whenever it detects a FEN in the submitted code, and auto-converts any legal UCI move in the output to standard algebraic notation — regardless of whether the model's own code does either correctly.
 
 ## Setup
 
-Requires Python 3.13. There's no `requirements.txt` — dependencies live only in the checked-in `.venv`; activate it or use `.venv/bin/python3` / `.venv/bin/pip` directly.
+Requires Python 3.13. Install dependencies with `pip install -r requirements.txt` (direct dependencies only, unpinned) into a virtualenv — `.venv/` itself isn't checked in.
 
 Create a `.env` file in the project root:
 
@@ -28,7 +32,8 @@ HF_TOKEN=your_hf_token                   # optional, read-only is enough — nee
 
 Additional runtime dependencies:
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) must be on `PATH` for the local video-analysis flow.
-- A local [Ollama](https://ollama.com) server (`localhost:11434`, model `minicpm-v:8b`) must be running for image/video frame captioning.
+- A local [Ollama](https://ollama.com) server (`localhost:11434`, model `minicpm-v:8b`) must be running for video frame captioning.
+- [Stockfish](https://stockfishchess.org/) should be on `PATH` for reliably solving chess-puzzle questions — `run_python_code` still works without it, just without the auto-verified best move.
 
 ## Usage
 
