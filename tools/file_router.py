@@ -1,19 +1,34 @@
 import json
 import mimetypes
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, HfHubHTTPError
 
 from tools.video_local import DEFAULT_VISION_MODEL, ollama_chat_with_image
 
 ATTACHMENT_CACHE_DIR = Path(".cache/attachments")
+# agents-course-unit4-scoring.hf.space/files/{task_id} 404s for tasks that do have a
+# file (known upstream bug: https://discuss.huggingface.co/t/get-files-task-id-returning-404-for-every-task-id-with-file-name/170575).
+# When that happens, fall back to fetching the file directly from the dataset on the
+# Hub and cache it here instead, so re-runs don't need the Hub at all.
+LOCAL_ATTACHMENTS_DIR = Path(".local_attachments")
+GAIA_DATASET_REPO = "gaia-benchmark/GAIA"
+# The course's task set draws from the validation split (it needs public ground truth
+# to score), but try test too in case a future task set includes one of those files.
+GAIA_DATASET_SPLIT_PREFIXES = ("2023/validation", "2023/test")
 VideoLogger = Callable[[str], None]
 
 TEXT_EXTENSIONS = {".txt", ".md", ".json", ".csv", ".tsv", ".yaml", ".yml", ".xml", ".html", ".htm", ".log"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xls"}
+WHISPER_MODEL_SIZE = "base"
 
 AMBIGUITY_HINTS = (
     (r"\bbird\b", r"\bpenguin(s)?\b", "Penguins count as birds for bird-species questions."),
@@ -46,6 +61,10 @@ def detect_file_type(file_path: Path, content_type: str | None = None) -> str:
         return "image"
     if suffix in VIDEO_EXTENSIONS:
         return "video"
+    if suffix in AUDIO_EXTENSIONS:
+        return "audio"
+    if suffix in SPREADSHEET_EXTENSIONS:
+        return "spreadsheet"
     if suffix == ".pdf":
         return "pdf"
 
@@ -106,9 +125,74 @@ def save_attachment_response(task_id: str, response: requests.Response) -> Path:
     return file_path
 
 
-def download_attachment(task_id: str, api_base: str, emit: VideoLogger | None = None) -> tuple[Path | None, str | None]:
+def _local_attachment_cache_path(task_id: str, file_name: str) -> Path:
+    task_dir = LOCAL_ATTACHMENTS_DIR / re.sub(r"[^0-9A-Za-z_-]+", "_", task_id)
+    # file_name comes from GAIA task metadata; take only the basename so a value like
+    # "../../evil.txt" can't resolve the cache path outside task_dir.
+    return task_dir / Path(file_name).name
+
+
+def _download_from_hub_fallback(task_id: str, file_name: str, emit: VideoLogger | None = None) -> Path | None:
+    token = os.getenv("HF_TOKEN")
+    downloaded_path = None
+    last_error: Exception | None = None
+    for split_prefix in GAIA_DATASET_SPLIT_PREFIXES:
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=GAIA_DATASET_REPO,
+                filename=f"{split_prefix}/{file_name}",
+                repo_type="dataset",
+                token=token,
+            )
+            break
+        except EntryNotFoundError as exc:
+            # Expected: file genuinely isn't in this split, try the next one.
+            last_error = exc
+        except (GatedRepoError, HfHubHTTPError) as exc:
+            # Auth/access/network problem, not a "file not found" -- same token and repo
+            # for every split, so retrying the next split would fail identically. Surface
+            # this distinctly instead of masking it as a generic miss.
+            if emit:
+                emit(
+                    f"[file-router] Hub fallback auth/access error for {file_name} "
+                    f"(check HF_TOKEN and gated-dataset access): {exc}"
+                )
+            return None
+        except Exception as exc:
+            last_error = exc
+
+    if downloaded_path is None:
+        if emit:
+            emit(f"[file-router] Hub fallback failed for {file_name}: {last_error}")
+        return None
+
+    dest_file = _local_attachment_cache_path(task_id, file_name)
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+    dest_file.write_bytes(Path(downloaded_path).read_bytes())
+    if emit:
+        emit(f"[file-router] downloaded attachment via Hub fallback: {dest_file}")
+    return dest_file
+
+
+def download_attachment(
+    task_id: str,
+    api_base: str,
+    emit: VideoLogger | None = None,
+    file_name: str | None = None,
+) -> tuple[Path | None, str | None]:
+    if file_name:
+        cached_path = _local_attachment_cache_path(task_id, file_name)
+        if cached_path.exists():
+            if emit:
+                emit(f"[file-router] using locally cached attachment: {cached_path}")
+            return cached_path, mimetypes.guess_type(str(cached_path))[0]
+
     response = requests.get(f"{api_base}/files/{task_id}", timeout=120)
     if response.status_code == 404:
+        if file_name:
+            fallback_path = _download_from_hub_fallback(task_id, file_name, emit=emit)
+            if fallback_path:
+                return fallback_path, mimetypes.guess_type(str(fallback_path))[0]
         return None, None
 
     response.raise_for_status()
@@ -162,6 +246,53 @@ def ocr_or_vision_for_visual_content(
     return ollama_chat_with_image(model=model, prompt=prompt, image_path=file_path, emit=emit)
 
 
+_whisper_model_cache: dict[str, Any] = {}
+
+
+def _get_whisper_model(model_size: str = WHISPER_MODEL_SIZE) -> Any:
+    if model_size not in _whisper_model_cache:
+        from faster_whisper import WhisperModel
+
+        _whisper_model_cache[model_size] = WhisperModel(model_size, device="cpu", compute_type="int8")
+    return _whisper_model_cache[model_size]
+
+
+def transcribe_audio_content(file_path: Path, emit: VideoLogger | None = None) -> str:
+    if file_path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return f"AUDIO_TRANSCRIPTION_UNAVAILABLE: unsupported audio file type {file_path.suffix or '<none>'}."
+
+    try:
+        model = _get_whisper_model()
+        if emit:
+            emit(f"[file-router] transcribing {file_path.name} with local Whisper ({WHISPER_MODEL_SIZE})")
+        segments, _info = model.transcribe(str(file_path))
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+    except Exception as exc:
+        return f"UNSUPPORTED_AUDIO_EXTRACTION: failed to transcribe {file_path.name}: {exc}"
+
+    if not text:
+        return "NO_TRANSCRIPT_AVAILABLE: audio transcription produced no text."
+    return text
+
+
+def parse_spreadsheet_content(file_path: Path) -> str:
+    if file_path.suffix.lower() not in SPREADSHEET_EXTENSIONS:
+        return f"SPREADSHEET_PARSE_UNAVAILABLE: unsupported spreadsheet file type {file_path.suffix or '<none>'}."
+
+    try:
+        import pandas as pd
+
+        sheets = pd.read_excel(file_path, sheet_name=None)
+    except Exception as exc:
+        return f"UNSUPPORTED_SPREADSHEET_EXTRACTION: failed to parse {file_path.name}: {exc}"
+
+    parts: list[str] = []
+    for sheet_name, dataframe in sheets.items():
+        parts.append(f"Sheet: {sheet_name}")
+        parts.append(dataframe.to_csv(index=False))
+    return "\n\n".join(parts).strip()
+
+
 def normalize_entities(raw_text: str) -> str:
     lines = [line.strip() for line in raw_text.splitlines()]
     collapsed_lines: list[str] = []
@@ -201,8 +332,11 @@ def build_attachment_evidence(
     task_id: str,
     question_text: str,
     emit: VideoLogger | None = None,
+    file_name: str | None = None,
 ) -> str:
-    attachment_path, content_type = download_attachment(task_id=task_id, api_base=api_base, emit=emit)
+    attachment_path, content_type = download_attachment(
+        task_id=task_id, api_base=api_base, emit=emit, file_name=file_name
+    )
     if attachment_path is None:
         return "Attachment evidence: none."
 
@@ -214,6 +348,10 @@ def build_attachment_evidence(
         raw_content = parse_textual_content(attachment_path)
     elif file_type == "image":
         raw_content = ocr_or_vision_for_visual_content(attachment_path, emit=emit)
+    elif file_type == "audio":
+        raw_content = transcribe_audio_content(attachment_path, emit=emit)
+    elif file_type == "spreadsheet":
+        raw_content = parse_spreadsheet_content(attachment_path)
     elif file_type == "pdf":
         raw_content = "UNSUPPORTED_FILE_TYPE: PDF attachment detected, but no local PDF text/vision extractor is configured."
     else:

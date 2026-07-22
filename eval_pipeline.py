@@ -71,12 +71,18 @@ def get_question_by_task_id(task_id: str) -> dict[str, Any]:
     raise ValueError(f"Task id not found in /questions: {task_id}")
 
 
+def question_file_name(question: dict[str, Any]) -> str | None:
+    file_name = question.get("file_name")
+    return str(file_name) if file_name else None
+
+
 def question_has_attachment(question: dict[str, Any]) -> bool:
     attachment_keys = (
         "has_file",
         "file",
         "file_url",
         "file_id",
+        "file_name",
         "attachment",
         "attachments",
         "has_attachment",
@@ -90,8 +96,10 @@ def question_has_attachment(question: dict[str, Any]) -> bool:
     return False
 
 
-def download_task_file(task_id: str, output_dir: Path = DEFAULT_ATTACHMENT_DIR) -> Path | None:
-    file_path, _ = download_attachment(task_id=task_id, api_base=API_BASE, emit=None)
+def download_task_file(
+    task_id: str, output_dir: Path = DEFAULT_ATTACHMENT_DIR, file_name: str | None = None
+) -> Path | None:
+    file_path, _ = download_attachment(task_id=task_id, api_base=API_BASE, emit=print, file_name=file_name)
     return file_path
 
 
@@ -181,6 +189,7 @@ def solve_question(question: dict[str, Any], verbose: bool = False, diagnostics:
             task_id=task_id,
             question_text=base_question,
             emit=print if verbose else None,
+            file_name=question_file_name(question),
         )
         evidence_blocks.append(attachment_evidence)
 
@@ -215,6 +224,7 @@ NUMERIC_QUESTION_HINTS = (
     "what number",
     "what is the total",
     "total number",
+    "total sales",
     "highest number",
     "lowest number",
     "count",
@@ -299,7 +309,7 @@ def test_single_random_question(verbose: bool = True) -> None:
     print(f"attachment_detected: {question_has_attachment(question)}")
 
     if task_id and question_has_attachment(question):
-        file_path = download_task_file(str(task_id))
+        file_path = download_task_file(str(task_id), file_name=question_file_name(question))
         print(f"attachment_downloaded_to: {file_path}")
 
     print("\n🤖 Running agent...")
@@ -355,13 +365,10 @@ def build_answer_jsonl(output_file: Path = DEFAULT_OUTPUT_FILE, verbose: bool = 
         except Exception as exc:
             print(f"Failed task {task_id}: {exc}")
             print(f"Question text: {question.get('question')}")
-            record = {
-                "task_id": task_id,
-                "model_answer": "",
-            }
-            append_jsonl_record(output_file, record)
-            results.append(record)
-            completed_task_ids.add(task_id)
+            # Do not mark this task_id as completed and do not write a record: a blank
+            # answer would otherwise get silently resubmitted to the real, rate-limited
+            # scoring endpoint by a later `submit-all` run. Leaving it out of the file
+            # means the next `build-jsonl` run retries it instead.
 
     print(f"\nWrote clean JSONL to {output_file.resolve()}")
     return results
@@ -415,13 +422,52 @@ def submit_one_question(username: str, agent_path: Path, task_id: str | None = N
     print(json.dumps(response, ensure_ascii=False, indent=2))
 
 
+def submit_all_answers(username: str, agent_path: Path, output_file: Path = DEFAULT_OUTPUT_FILE) -> None:
+    if not output_file.exists():
+        raise FileNotFoundError(f"{output_file} does not exist. Run --mode build-jsonl first.")
+
+    records: list[dict[str, Any]] = []
+    with output_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+
+    if not records:
+        raise ValueError(f"{output_file} has no records to submit.")
+
+    blank_task_ids = [r["task_id"] for r in records if not str(r.get("model_answer", "")).strip()]
+    if blank_task_ids:
+        print(
+            f"Skipping {len(blank_task_ids)} record(s) with a blank model_answer "
+            f"(re-run build-jsonl to fill these in first): {blank_task_ids}"
+        )
+    records = [r for r in records if str(r.get("model_answer", "")).strip()]
+    if not records:
+        raise ValueError(f"{output_file} has no non-blank records to submit.")
+
+    print(f"Submitting {len(records)} answers from {output_file}...")
+    agent_code = load_agent_code(agent_path)
+    response = submit_answers(
+        username=username,
+        agent_code=agent_code,
+        answers=[{"task_id": r["task_id"], "model_answer": r["model_answer"]} for r in records],
+    )
+    print(json.dumps(response, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GAIA evaluation pipeline")
     parser.add_argument(
         "--mode",
-        choices=("test-one", "build-jsonl", "submit-one"),
+        choices=("test-one", "build-jsonl", "submit-one", "submit-all"),
         default="test-one",
-        help="test-one: run one random question, build-jsonl: solve all questions and write JSONL, submit-one: submit one solved question to /submit",
+        help=(
+            "test-one: run one random question, build-jsonl: solve all questions and write JSONL, "
+            "submit-one: submit one solved question to /submit, "
+            "submit-all: submit every answer already in the JSONL output file to /submit"
+        ),
     )
     parser.add_argument("--output-file", default=str(DEFAULT_OUTPUT_FILE))
     parser.add_argument("--username", default="")
@@ -442,7 +488,11 @@ def main() -> None:
         return
 
     if not args.username:
-        raise ValueError("--username is required when --mode submit-one")
+        raise ValueError(f"--username is required when --mode {args.mode}")
+
+    if args.mode == "submit-all":
+        submit_all_answers(args.username, agent_path, output_file)
+        return
 
     submit_one_question(args.username, agent_path, task_id=args.task_id or None, verbose=not args.quiet)
 

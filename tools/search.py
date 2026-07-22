@@ -1,8 +1,33 @@
-from langchain.tools import tool
-from langchain_community.tools import DuckDuckGoSearchRun
+from urllib.parse import urlparse
 
-# 实例化原始工具
-ddg_search = DuckDuckGoSearchRun()
+from langchain.tools import tool
+from langchain_community.tools import DuckDuckGoSearchResults
+
+# DuckDuckGoSearchRun returns one unstructured text blob where URLs (if present
+# at all) are truncated and disconnected from the snippet they belong to, so the
+# agent has no real URL to hand to fetch_page. DuckDuckGoSearchResults returns
+# structured {title, link, snippet} results with a complete URL per result.
+ddg_search = DuckDuckGoSearchResults(output_format="list", num_results=6)
+
+# Homework-answer aggregator sites that scrape benchmark questions verbatim and post
+# AI-generated answers of unknown/low quality -- these have shown up confidently
+# stating wrong facts (e.g. a wrong competition year), which actively misleads the
+# agent rather than just being unhelpful noise. Block them outright.
+BLOCKED_SEARCH_DOMAINS = frozenset({
+    "studyx.ai",
+    "coursehero.com",
+    "chegg.com",
+    "quizlet.com",
+    "brainly.com",
+    "numerade.com",
+    "gauthmath.com",
+    "answers.com",
+})
+
+
+def _is_blocked_domain(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(hostname == domain or hostname.endswith("." + domain) for domain in BLOCKED_SEARCH_DOMAINS)
 
 
 def _looks_like_multi_item_query(query: str) -> bool:
@@ -30,7 +55,9 @@ def _extract_first_candidate_from_broad_query(query: str) -> str | None:
 
 @tool
 def search_internet(query: str) -> str:
-    """当你需要查找实时信息、新闻、汇率、天气或无法直接回答的问题时，使用此工具。"""
+    """Use this for real-time information, news, exchange rates, weather, or anything
+    that cannot be answered directly. Each result includes a full URL -- pass that URL
+    to fetch_page to read the actual page instead of relying on the snippet alone."""
     if _looks_like_multi_item_query(query):
         specific_item = _extract_first_candidate_from_broad_query(query)
         if specific_item:
@@ -41,5 +68,15 @@ def search_internet(query: str) -> str:
                 "Search one specific candidate item at a time instead of querying the whole list."
             )
 
-    result = ddg_search.invoke(query)
-    return result
+    results = ddg_search.invoke(query)
+    results = [item for item in results if not _is_blocked_domain(item.get("link", ""))]
+    if not results:
+        return "NO_RESULTS: the search returned nothing."
+
+    formatted = []
+    for i, item in enumerate(results, start=1):
+        title = item.get("title", "").strip()
+        link = item.get("link", "").strip()
+        snippet = item.get("snippet", "").strip()
+        formatted.append(f"{i}. {title}\n   URL: {link}\n   {snippet}")
+    return "\n".join(formatted)
