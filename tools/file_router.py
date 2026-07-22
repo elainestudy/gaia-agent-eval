@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import requests
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, HfHubHTTPError
 
 from tools.video_local import DEFAULT_VISION_MODEL, ollama_chat_with_image
 
@@ -126,7 +127,9 @@ def save_attachment_response(task_id: str, response: requests.Response) -> Path:
 
 def _local_attachment_cache_path(task_id: str, file_name: str) -> Path:
     task_dir = LOCAL_ATTACHMENTS_DIR / re.sub(r"[^0-9A-Za-z_-]+", "_", task_id)
-    return task_dir / file_name
+    # file_name comes from GAIA task metadata; take only the basename so a value like
+    # "../../evil.txt" can't resolve the cache path outside task_dir.
+    return task_dir / Path(file_name).name
 
 
 def _download_from_hub_fallback(task_id: str, file_name: str, emit: VideoLogger | None = None) -> Path | None:
@@ -142,6 +145,19 @@ def _download_from_hub_fallback(task_id: str, file_name: str, emit: VideoLogger 
                 token=token,
             )
             break
+        except EntryNotFoundError as exc:
+            # Expected: file genuinely isn't in this split, try the next one.
+            last_error = exc
+        except (GatedRepoError, HfHubHTTPError) as exc:
+            # Auth/access/network problem, not a "file not found" -- same token and repo
+            # for every split, so retrying the next split would fail identically. Surface
+            # this distinctly instead of masking it as a generic miss.
+            if emit:
+                emit(
+                    f"[file-router] Hub fallback auth/access error for {file_name} "
+                    f"(check HF_TOKEN and gated-dataset access): {exc}"
+                )
+            return None
         except Exception as exc:
             last_error = exc
 

@@ -71,6 +71,11 @@ def get_question_by_task_id(task_id: str) -> dict[str, Any]:
     raise ValueError(f"Task id not found in /questions: {task_id}")
 
 
+def question_file_name(question: dict[str, Any]) -> str | None:
+    file_name = question.get("file_name")
+    return str(file_name) if file_name else None
+
+
 def question_has_attachment(question: dict[str, Any]) -> bool:
     attachment_keys = (
         "has_file",
@@ -94,7 +99,7 @@ def question_has_attachment(question: dict[str, Any]) -> bool:
 def download_task_file(
     task_id: str, output_dir: Path = DEFAULT_ATTACHMENT_DIR, file_name: str | None = None
 ) -> Path | None:
-    file_path, _ = download_attachment(task_id=task_id, api_base=API_BASE, emit=None, file_name=file_name)
+    file_path, _ = download_attachment(task_id=task_id, api_base=API_BASE, emit=print, file_name=file_name)
     return file_path
 
 
@@ -184,7 +189,7 @@ def solve_question(question: dict[str, Any], verbose: bool = False, diagnostics:
             task_id=task_id,
             question_text=base_question,
             emit=print if verbose else None,
-            file_name=str(question.get("file_name", "")) or None,
+            file_name=question_file_name(question),
         )
         evidence_blocks.append(attachment_evidence)
 
@@ -219,7 +224,6 @@ NUMERIC_QUESTION_HINTS = (
     "what number",
     "what is the total",
     "total number",
-    "the total",
     "total sales",
     "highest number",
     "lowest number",
@@ -305,7 +309,7 @@ def test_single_random_question(verbose: bool = True) -> None:
     print(f"attachment_detected: {question_has_attachment(question)}")
 
     if task_id and question_has_attachment(question):
-        file_path = download_task_file(str(task_id), file_name=str(question.get("file_name", "")) or None)
+        file_path = download_task_file(str(task_id), file_name=question_file_name(question))
         print(f"attachment_downloaded_to: {file_path}")
 
     print("\n🤖 Running agent...")
@@ -361,13 +365,10 @@ def build_answer_jsonl(output_file: Path = DEFAULT_OUTPUT_FILE, verbose: bool = 
         except Exception as exc:
             print(f"Failed task {task_id}: {exc}")
             print(f"Question text: {question.get('question')}")
-            record = {
-                "task_id": task_id,
-                "model_answer": "",
-            }
-            append_jsonl_record(output_file, record)
-            results.append(record)
-            completed_task_ids.add(task_id)
+            # Do not mark this task_id as completed and do not write a record: a blank
+            # answer would otherwise get silently resubmitted to the real, rate-limited
+            # scoring endpoint by a later `submit-all` run. Leaving it out of the file
+            # means the next `build-jsonl` run retries it instead.
 
     print(f"\nWrote clean JSONL to {output_file.resolve()}")
     return results
@@ -435,6 +436,16 @@ def submit_all_answers(username: str, agent_path: Path, output_file: Path = DEFA
 
     if not records:
         raise ValueError(f"{output_file} has no records to submit.")
+
+    blank_task_ids = [r["task_id"] for r in records if not str(r.get("model_answer", "")).strip()]
+    if blank_task_ids:
+        print(
+            f"Skipping {len(blank_task_ids)} record(s) with a blank model_answer "
+            f"(re-run build-jsonl to fill these in first): {blank_task_ids}"
+        )
+    records = [r for r in records if str(r.get("model_answer", "")).strip()]
+    if not records:
+        raise ValueError(f"{output_file} has no non-blank records to submit.")
 
     print(f"Submitting {len(records)} answers from {output_file}...")
     agent_code = load_agent_code(agent_path)

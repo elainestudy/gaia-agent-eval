@@ -45,6 +45,16 @@ def _is_wayback_hostname(hostname: str) -> bool:
     return hostname == "web.archive.org"
 
 
+WAYBACK_URL_PATTERN = re.compile(r"^https?://web\.archive\.org/web/[^/]+/(.+)$", re.IGNORECASE)
+
+
+def _wayback_target_hostname(url: str) -> str:
+    match = WAYBACK_URL_PATTERN.match(url)
+    if not match:
+        return ""
+    return (urlparse(match.group(1)).hostname or "").lower()
+
+
 # Jina exposes a page's publish/update metadata as this header line when the source
 # HTML has it. Many "live state" pages (rosters, dashboards) don't set that metadata at
 # all and instead render today's actual date straight into the visible page text.
@@ -55,13 +65,18 @@ DATE_BANNER_PATTERN = re.compile(
     r"\s+\d{1,2},?\s+\d{4}\b"
 )
 LIVE_PAGE_WARNING_THRESHOLD_DAYS = 2
+# A page's own "current state" banner (dashboards, rosters) is chrome that sits at the
+# top of the document; body prose further down can coincidentally contain a full
+# "Weekday, Month Day, Year" string (e.g. discussing a historical event) without being
+# the page's own live-state indicator. Only trust the banner pattern near the top.
+DATE_BANNER_SEARCH_WINDOW_CHARS = 2000
 
 
 def _detect_page_date(text: str):
     match = PUBLISHED_TIME_PATTERN.search(text)
     candidate = match.group(1).strip() if match else None
     if not candidate:
-        banner_match = DATE_BANNER_PATTERN.search(text)
+        banner_match = DATE_BANNER_PATTERN.search(text[:DATE_BANNER_SEARCH_WINDOW_CHARS])
         candidate = banner_match.group(0) if banner_match else None
     if not candidate:
         return None
@@ -94,6 +109,29 @@ def _html_to_text(html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
+def _extract_wayback_text(raw_html: str, content_selector_id: str | None) -> str:
+    """Extract text from an archived page, preferring the same content-only element
+    Jina's X-Target-Selector would pick out for a live Wikipedia/LibreTexts fetch --
+    Wayback snapshots go through requests directly, not Jina, so that header has no
+    effect here and the same selection has to be done locally."""
+    if content_selector_id:
+        try:
+            from lxml import etree, html as lxml_html
+
+            tree = lxml_html.fromstring(raw_html)
+            etree.strip_elements(tree, "script", "style", with_tail=False)
+            element = tree.get_element_by_id(content_selector_id, None)
+            if element is not None:
+                text = element.text_content()
+                text = re.sub(r"[ \t]+", " ", text)
+                text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return _html_to_text(raw_html)
 
 
 def _strip_latex_macro_boilerplate(text: str) -> str:
@@ -134,6 +172,15 @@ def fetch_page(url: str) -> str:
         return "FETCH_PAGE_BLOCKED: this URL targets a private, local, or reserved network address."
 
     if _is_wayback_hostname(hostname):
+        target_hostname = _wayback_target_hostname(normalized_url)
+        is_wikipedia = _is_wikipedia_hostname(target_hostname)
+        is_libretexts = _is_libretexts_hostname(target_hostname)
+        content_selector_id = None
+        if is_wikipedia:
+            content_selector_id = WIKIPEDIA_CONTENT_SELECTOR.lstrip("#")
+        elif is_libretexts:
+            content_selector_id = LIBRETEXTS_CONTENT_SELECTOR.lstrip("#")
+
         try:
             response = requests.get(normalized_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
             if response.status_code == 404:
@@ -145,12 +192,21 @@ def fetch_page(url: str) -> str:
                     "reconstruct a different path; reuse that exact known-working URL."
                 )
             response.raise_for_status()
-            text = _html_to_text(response.text)
+            text = _extract_wayback_text(response.text, content_selector_id)
             if not text:
                 return "FETCH_PAGE_EMPTY: the page returned no readable content."
+            if any(marker in text for marker in DYNAMIC_RENDER_MARKERS):
+                return (
+                    "FETCH_PAGE_DYNAMIC_CONTENT: this page renders its content client-side (MindTouch) "
+                    "and the fetched text is navigation/config, not the actual article body. "
+                    "Try search_internet to find a cached or mirrored copy of this page's content instead."
+                )
+            text = IMAGE_MARKDOWN_PATTERN.sub(r"\1", text)
+            text = _strip_latex_macro_boilerplate(text)
             text = _maybe_prepend_live_page_warning(text)
-            if len(text) > DEFAULT_MAX_RESPONSE_CHARS:
-                text = text[:DEFAULT_MAX_RESPONSE_CHARS] + "\n\n[TRUNCATED: page content exceeds character limit]"
+            max_chars = WIKIPEDIA_MAX_RESPONSE_CHARS if is_wikipedia else DEFAULT_MAX_RESPONSE_CHARS
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n\n[TRUNCATED: page content exceeds character limit]"
             return text
         except Exception as exc:
             return f"FETCH_PAGE_FAILED: {exc}"
