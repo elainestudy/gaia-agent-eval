@@ -8,7 +8,7 @@ An agent that answers **GAIA benchmark** questions for the Hugging Face "AI Agen
 
 ## Environment & running
 
-No `requirements.txt`/`pyproject.toml` exists — dependencies live only in the checked-in `.venv` (Python 3.13, key packages: `langchain`, `langchain-google-genai`, `langchain-community`, `duckduckgo_search`, `youtube_transcript_api`, `huggingface_hub`, `pandas`, `openpyxl`, `faster-whisper`, `python-dotenv`, `requests`, `lxml`). Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
+Dependencies are listed in `requirements.txt` (direct dependencies only, unpinned — install with `pip install -r requirements.txt`). `.venv` (Python 3.13) is gitignored, not checked in; it's the local install target, not the source of truth. `chess` (python-chess) isn't imported by any repo file directly -- it's installed so `run_python_code` can import it for board/legal-move reasoning on chess-puzzle tasks. Use `.venv/bin/python3` / `.venv/bin/pip` directly, or activate the venv first.
 
 Requires a `.env` file with:
 - `GOOGLE_API_KEY` — required, Gemini access for `agent.py`
