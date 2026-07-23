@@ -330,6 +330,33 @@ def append_jsonl_record(output_file: Path, record: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def upsert_jsonl_record(output_file: Path, record: dict[str, Any]) -> str:
+    """Insert or replace the record for record['task_id'] in output_file.
+
+    Returns "added", "updated", or "unchanged" so callers can log what happened.
+    """
+    task_id = str(record["task_id"])
+    existing_records: list[dict[str, Any]] = []
+    if output_file.exists():
+        with output_file.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped_line = line.strip()
+                if stripped_line:
+                    existing_records.append(json.loads(stripped_line))
+
+    for index, existing in enumerate(existing_records):
+        if str(existing.get("task_id")) == task_id:
+            if existing.get("model_answer") == record.get("model_answer"):
+                return "unchanged"
+            existing_records[index] = record
+            write_jsonl(existing_records, output_file)
+            return "updated"
+
+    existing_records.append(record)
+    write_jsonl(existing_records, output_file)
+    return "added"
+
+
 def build_answer_jsonl(output_file: Path = DEFAULT_OUTPUT_FILE, verbose: bool = False) -> list[dict[str, Any]]:
     print("🚀 Fetching all questions...")
     questions = get_all_questions()
@@ -393,7 +420,13 @@ def submit_answers(username: str, agent_code: str, answers: list[dict[str, Any]]
     return post_json(f"{API_BASE}/submit", payload)
 
 
-def submit_one_question(username: str, agent_path: Path, task_id: str | None = None, verbose: bool = True) -> None:
+def submit_one_question(
+    username: str,
+    agent_path: Path,
+    task_id: str | None = None,
+    verbose: bool = True,
+    output_file: Path = DEFAULT_OUTPUT_FILE,
+) -> None:
     if task_id:
         question = get_question_by_task_id(task_id)
         print(f"Testing submit with fixed task_id={task_id}")
@@ -407,19 +440,37 @@ def submit_one_question(username: str, agent_path: Path, task_id: str | None = N
     print(f"Attachment detected: {question_has_attachment(question)}")
 
     try:
-        answer = solve_question(question, verbose=verbose)
+        diagnostics: dict[str, Any] = {}
+        answer = solve_question(question, verbose=verbose, diagnostics=diagnostics)
     except Exception as exc:
         print(f"[submit-one failed during solve] {exc}")
         raise
 
+    clean_answer = clean_model_answer(answer, base_question)
     agent_code = load_agent_code(agent_path)
     response = submit_answers(
         username=username,
         agent_code=agent_code,
-        answers=[{"task_id": task_id, "model_answer": clean_model_answer(answer, base_question)}],
+        answers=[{"task_id": task_id, "model_answer": clean_answer}],
     )
-    print(f"clean_answer: {clean_model_answer(answer, base_question)}")
+    print(f"clean_answer: {clean_answer}")
     print(json.dumps(response, ensure_ascii=False, indent=2))
+
+    correct_count = response.get("correct_count")
+    total_attempted = response.get("total_attempted")
+    if total_attempted and correct_count == total_attempted:
+        record = {
+            "task_id": task_id,
+            "model_answer": clean_answer,
+            "used_fallback": diagnostics.get("used_fallback", False),
+        }
+        status = upsert_jsonl_record(output_file, record)
+        if status == "added":
+            print(f"✅ Correct — added task {task_id} to {output_file}.")
+        elif status == "updated":
+            print(f"✅ Correct — replaced the existing answer for task {task_id} in {output_file}.")
+        else:
+            print(f"✅ Correct — {output_file} already had this answer for task {task_id}; no change needed.")
 
 
 def submit_all_answers(username: str, agent_path: Path, output_file: Path = DEFAULT_OUTPUT_FILE) -> None:
@@ -494,7 +545,9 @@ def main() -> None:
         submit_all_answers(args.username, agent_path, output_file)
         return
 
-    submit_one_question(args.username, agent_path, task_id=args.task_id or None, verbose=not args.quiet)
+    submit_one_question(
+        args.username, agent_path, task_id=args.task_id or None, verbose=not args.quiet, output_file=output_file
+    )
 
 
 if __name__ == "__main__":

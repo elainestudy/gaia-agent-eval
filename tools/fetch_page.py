@@ -65,19 +65,35 @@ DATE_BANNER_PATTERN = re.compile(
     r"\s+\d{1,2},?\s+\d{4}\b"
 )
 LIVE_PAGE_WARNING_THRESHOLD_DAYS = 2
-# A page's own "current state" banner (dashboards, rosters) is chrome that sits at the
-# top of the document; body prose further down can coincidentally contain a full
-# "Weekday, Month Day, Year" string (e.g. discussing a historical event) without being
-# the page's own live-state indicator. Only trust the banner pattern near the top.
-DATE_BANNER_SEARCH_WINDOW_CHARS = 2000
+
+
+MAX_BANNER_LINE_LABEL_CHARS = 30
+
+
+def _is_standalone_banner_line(text: str, start: int, end: int) -> bool:
+    """A page's own "current state" banner (dashboards, rosters) occupies its own line,
+    at most with a short label like "Last updated:"/"As of"; body prose that
+    coincidentally contains a full "Weekday, Month Day, Year" string (e.g. discussing a
+    historical event) shares its line with a much longer surrounding sentence. Checking
+    line position rather than a fixed character offset also survives pages with a lot of
+    nav chrome before the real banner."""
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end].strip()
+    date_text = text[start:end].strip()
+    return len(line) - len(date_text) <= MAX_BANNER_LINE_LABEL_CHARS
 
 
 def _detect_page_date(text: str):
     match = PUBLISHED_TIME_PATTERN.search(text)
     candidate = match.group(1).strip() if match else None
     if not candidate:
-        banner_match = DATE_BANNER_PATTERN.search(text[:DATE_BANNER_SEARCH_WINDOW_CHARS])
-        candidate = banner_match.group(0) if banner_match else None
+        for banner_match in DATE_BANNER_PATTERN.finditer(text):
+            if _is_standalone_banner_line(text, banner_match.start(), banner_match.end()):
+                candidate = banner_match.group(0)
+                break
     if not candidate:
         return None
     try:

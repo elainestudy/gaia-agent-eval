@@ -1,3 +1,4 @@
+import base64
 import json
 import mimetypes
 import os
@@ -6,10 +7,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
+from dotenv import load_dotenv
 from huggingface_hub import hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError, GatedRepoError, HfHubHTTPError
+from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-from tools.video_local import DEFAULT_VISION_MODEL, ollama_chat_with_image
+load_dotenv()
+
+# Single-image attachments go through Gemini's own multimodal input instead of the local
+# Ollama model used elsewhere (tools/video_local.py) -- empirically far more reliable for
+# precise structured reading (e.g. a chessboard's actual coordinate orientation). A GAIA
+# task has at most one image attachment, so the added API cost per question is bounded;
+# a video can produce many sampled frames, so that path stays on the free local model.
+GEMINI_VISION_MODEL = "gemini-3.1-flash-lite"
+_gemini_vision_llm: ChatGoogleGenerativeAI | None = None
 
 ATTACHMENT_CACHE_DIR = Path(".cache/attachments")
 # agents-course-unit4-scoring.hf.space/files/{task_id} 404s for tasks that do have a
@@ -224,26 +236,143 @@ def parse_textual_content(file_path: Path) -> str:
         return "UNSUPPORTED_TEXT_EXTRACTION: file is not readable as UTF-8 text."
 
 
+VISION_PROMPT = (
+    "You are looking at one visual attachment from a GAIA task.\n"
+    "Describe the visible content as thoroughly and systematically as possible: every "
+    "distinct object, symbol, or piece of text visible, and its position or spatial "
+    "relationship to the others. Do not stop after the first few salient items.\n"
+    "If the image shows a grid, board, table, map, or other structured layout with its own "
+    "coordinate labels (e.g. a chessboard with rank numbers and file letters): first read "
+    "and state the coordinate labels themselves, in the order they actually appear in the "
+    "image -- do not assume a standard orientation, since labels can be reversed, rotated, "
+    "or mirrored. Then scan systematically row by row and describe every occupied cell "
+    "using those exact labels; do not skip any occupied cell.\n"
+    "For a chessboard specifically: after the row-by-row scan, also list every occupied "
+    "square on its own line in exactly this format (one line per piece, using the square's "
+    "real label as read from the image, not an assumed one):\n"
+    "BOARD_SQUARE: <square> <white|black> <king|queen|rook|bishop|knight|pawn>\n"
+    "Before finalizing, count the BOARD_SQUARE lines and confirm there is exactly one white "
+    "king and exactly one black king among them; if not, look again and correct it.\n"
+    "Do not guess the final answer or interpret what the content means; only report what is "
+    "visible, exhaustively and precisely.\n"
+    "If an object is a subclass of a broader concept, mention the broader concept too.\n"
+    "Examples: penguin -> bird, soda -> drink, keyboard -> input device.\n"
+    "Return plain text, not JSON."
+)
+BOARD_SQUARE_LINE_PATTERN = re.compile(r"BOARD_SQUARE\w*:\s*(.+)", re.IGNORECASE)
+SQUARE_TOKEN_PATTERN = re.compile(r"\b([a-h][1-8])\b", re.IGNORECASE)
+COLOR_TOKEN_PATTERN = re.compile(r"\b(white|black)\b", re.IGNORECASE)
+PIECE_TOKEN_PATTERN = re.compile(r"\b(king|queen|rook|bishop|knight|pawn)\b", re.IGNORECASE)
+PIECE_LETTERS = {"king": "k", "queen": "q", "rook": "r", "bishop": "b", "knight": "n", "pawn": "p"}
+CHESS_CONTENT_PATTERN = re.compile(r"\bchess\b", re.IGNORECASE)
+
+
+def _parse_board_squares(text: str) -> list[tuple[str, str, str]] | None:
+    # Look for the three required tokens anywhere on the line rather than requiring an
+    # exact literal format -- the model reliably names square/color/piece but not
+    # reliably the punctuation around them (brackets, colons, commas all show up).
+    results: list[tuple[str, str, str]] = []
+    for line_match in BOARD_SQUARE_LINE_PATTERN.finditer(text):
+        rest = line_match.group(1)
+        square_match = SQUARE_TOKEN_PATTERN.search(rest)
+        color_match = COLOR_TOKEN_PATTERN.search(rest)
+        piece_match = PIECE_TOKEN_PATTERN.search(rest)
+        if square_match and color_match and piece_match:
+            results.append((square_match.group(1).lower(), color_match.group(1).lower(), piece_match.group(1).lower()))
+    return results or None
+
+
+def _build_validated_board_fen(squares: list[tuple[str, str, str]]) -> str | None:
+    """Build a board from the model's per-square readings ourselves rather than trusting
+    the model to assemble a correct FEN string itself -- and reject it outright if it's
+    not even a legal-looking chess position (missing/duplicate king), since that's a
+    reliable, cheap signal that the reading itself was wrong."""
+    import chess
+
+    board = chess.Board(None)
+    seen_squares: set[str] = set()
+    try:
+        for square_name, color, piece in squares:
+            if square_name in seen_squares:
+                return None
+            seen_squares.add(square_name)
+            symbol = PIECE_LETTERS[piece]
+            if color == "white":
+                symbol = symbol.upper()
+            board.set_piece_at(chess.parse_square(square_name), chess.Piece.from_symbol(symbol))
+    except ValueError:
+        return None
+
+    if len(board.pieces(chess.KING, chess.WHITE)) != 1 or len(board.pieces(chess.KING, chess.BLACK)) != 1:
+        return None
+    return board.board_fen()
+
+
+def _get_gemini_vision_llm() -> ChatGoogleGenerativeAI:
+    global _gemini_vision_llm
+    if _gemini_vision_llm is None:
+        _gemini_vision_llm = ChatGoogleGenerativeAI(model=GEMINI_VISION_MODEL)
+    return _gemini_vision_llm
+
+
+def _normalize_gemini_vision_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [str(item.get("text", "")) for item in content if isinstance(item, dict) and item.get("type") == "text"]
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def gemini_vision_describe(prompt: str, image_path: Path, emit: VideoLogger | None = None) -> str:
+    mime_type = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_b64}"}},
+        ]
+    )
+    if emit:
+        emit(f"[file-router] calling Gemini vision model={GEMINI_VISION_MODEL} on {image_path.name}")
+    response = _get_gemini_vision_llm().invoke([message])
+    return _normalize_gemini_vision_content(response.content)
+
+
 def ocr_or_vision_for_visual_content(
     file_path: Path,
     emit: VideoLogger | None = None,
-    model: str = DEFAULT_VISION_MODEL,
 ) -> str:
     if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
         return f"VISUAL_ANALYSIS_UNAVAILABLE: unsupported visual file type {file_path.suffix or '<none>'}."
 
-    prompt = (
-        "You are looking at one visual attachment from a GAIA task.\n"
-        "Describe the visible content objectively and conservatively.\n"
-        "List what is present, what it resembles, and any category ambiguities.\n"
-        "Do not guess the final answer.\n"
-        "If the image seems to show a subclass of a broader concept, mention the broader concept too.\n"
-        "Examples: penguin -> bird, soda -> drink, keyboard -> input device.\n"
-        "Return plain text, not JSON."
-    )
-    if emit:
-        emit(f"[file-router] running local vision model on {file_path.name}")
-    return ollama_chat_with_image(model=model, prompt=prompt, image_path=file_path, emit=emit)
+    description = gemini_vision_describe(VISION_PROMPT, file_path, emit=emit)
+
+    squares = _parse_board_squares(description)
+    board_fen = _build_validated_board_fen(squares) if squares else None
+
+    # Retry once whenever this looks like a chessboard but we didn't come away with a
+    # valid FEN -- whether because the model ignored the BOARD_SQUARE format entirely or
+    # because the squares it did list didn't form a legal-looking position.
+    if not board_fen and CHESS_CONTENT_PATTERN.search(description):
+        if emit:
+            emit("[file-router] no valid board FEN parsed from a likely chessboard image, retrying vision call once")
+        retry_prompt = VISION_PROMPT + (
+            "\n\nYour previous attempt did not produce a valid BOARD_SQUARE line for every "
+            "occupied square (or the resulting position was invalid, e.g. a missing or "
+            "duplicate king) -- look at the image again more carefully and output one "
+            "BOARD_SQUARE line per occupied square, exactly in the format instructed above."
+        )
+        description = gemini_vision_describe(retry_prompt, file_path, emit=emit)
+        squares = _parse_board_squares(description)
+        board_fen = _build_validated_board_fen(squares) if squares else None
+
+    if board_fen:
+        description += (
+            f"\n\nBoard FEN (piece placement only, parsed from the BOARD_SQUARE lines "
+            f"above and validated with python-chess -- exactly one king per side): {board_fen}"
+        )
+    return description
 
 
 _whisper_model_cache: dict[str, Any] = {}
