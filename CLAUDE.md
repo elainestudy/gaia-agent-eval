@@ -43,7 +43,9 @@ python3 eval_pipeline.py --mode submit-all --username YOUR_HF_USERNAME
 yt-dlp -f "worstvideo" -o ".cache/video/%(id)s/%(id)s.%(ext)s" "<youtube_url>"
 ```
 
-`build-jsonl` and `submit-one` skip/resume already-completed `task_id`s found in the output file, so re-running `build-jsonl` is safe.
+`build-jsonl` and `submit-one` skip/resume already-completed `task_id`s found in the output file, so re-running `build-jsonl` is safe. `submit-one` also inspects the scoring API's response (`correct_count == total_attempted`) and, when the single submitted answer was correct, upserts it into `--output-file` by `task_id` — this locks in a correct answer from a lucky non-deterministic run before a later `build-jsonl` re-solve has a chance to overwrite it with a wrong one.
+
+`run_agent()`'s tool-calling loop is hard-capped at `max_steps=10` (`agent.py`), so a single task never issues more than 10 requests to the underlying LLM — this keeps `test-one`/`submit-one` comfortably within free-tier RPM limits (e.g. Gemini's 15 RPM). `build-jsonl` has no delay/backoff between tasks, though, so running the full question set unthrottled can still stack up near/above an RPM cap even though each individual task stays in budget; if a 429 shows up mid-run, resume in smaller batches rather than adding retry logic that masks the real limit.
 
 ## Architecture
 

@@ -5,6 +5,12 @@ An agent that answers questions from the [GAIA benchmark](https://huggingface.co
 ## "score": 100.0 benchmark completed
 All 20 tasks in the set have been successfully solved by this agent at least once! While non-deterministic components like model sampling and VLM reads mean it’s not a 20/20 every single run, the ceiling is officially maxed out.
 
+## Free-tier friendly: ≤10 model requests per task
+
+`agent.py`'s tool-calling loop is hard-capped at `max_steps=10` — a single task can never issue more than 10 requests to the underlying LLM, no matter how much tool-calling it does (see `run_agent()`). That makes the agent usable on the free tier of pretty much any model provider. Gemini's free tier, for example, caps at 15 requests per minute (RPM); running questions one at a time (`test-one`, `submit-one`) stays well under that ceiling.
+
+The one place this budget doesn't protect you: `build-jsonl` walks through every question back-to-back with no delay or backoff between tasks. Since each task can burn through its 10 requests in well under a minute, running the full 20-question set unthrottled can still stack up near or above a 15 RPM cap and trip a 429, even though any single task is safely within budget. If you hit that, either add a delay between tasks or resume `build-jsonl` in smaller batches — it already skips `task_id`s already present in the output file, so it's safe to stop and restart.
+
 ## Architecture
 
 - **`agent.py`** — the agent core. A LangChain tool-calling loop around Gemini, bound to six tools (`search_internet`, `search_wikipedia`, `wolframalpha_query`, `get_youtube_transcript`, `fetch_page`, `run_python_code`). The system prompt enforces a strict **observe → classify → knowledge-lookup** workflow, designed to avoid two common failure modes: treating atypical category members incorrectly (e.g. a penguin is still a bird), and letting one broad search stand in for checking every item in a candidate list individually.
@@ -44,7 +50,10 @@ python3 eval_pipeline.py --mode test-one
 # Solve all questions and write a resumable answers file
 python3 eval_pipeline.py --mode build-jsonl --output-file my_submission.jsonl
 
-# Solve + submit one question to the scoring API
+# Solve + submit one question to the scoring API. If the API confirms it's correct,
+# the answer is also saved (or overwrites a stale one) in --output-file, so a lucky
+# submit-one run on a non-deterministic task doesn't get lost the next time
+# build-jsonl re-solves it.
 python3 eval_pipeline.py --mode submit-one --username YOUR_HF_USERNAME --agent-path agent.py
 
 # Replay a specific task instead of a random one
