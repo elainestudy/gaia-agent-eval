@@ -13,8 +13,8 @@ duckduckgo_search       # search_internet
 huggingface_hub         # tools/file_router.py Hub-fallback attachment download
 youtube_transcript_api  # get_youtube_transcript
 lxml                    # tools/fetch_page.py Wayback Machine content extraction
-chess                   # not imported by this repo's code -- available for run_python_code
-                        # to import when solving chess-puzzle GAIA tasks
+chess                   # imported directly by tools/run_code.py for deterministic
+                        # chess-puzzle move/board verification (incl. driving stockfish)
 
 # Attachment parsing (tools/file_router.py)
 pandas                  # spreadsheet attachments

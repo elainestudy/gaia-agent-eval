@@ -335,7 +335,10 @@ def gemini_vision_describe(prompt: str, image_path: Path, emit: VideoLogger | No
     )
     if emit:
         emit(f"[file-router] calling Gemini vision model={GEMINI_VISION_MODEL} on {image_path.name}")
-    response = _get_gemini_vision_llm().invoke([message])
+    try:
+        response = _get_gemini_vision_llm().invoke([message])
+    except Exception as exc:
+        return f"VISION_DESCRIPTION_FAILED: failed to describe {image_path.name}: {exc}"
     return _normalize_gemini_vision_content(response.content)
 
 
@@ -353,8 +356,13 @@ def ocr_or_vision_for_visual_content(
 
     # Retry once whenever this looks like a chessboard but we didn't come away with a
     # valid FEN -- whether because the model ignored the BOARD_SQUARE format entirely or
-    # because the squares it did list didn't form a legal-looking position.
-    if not board_fen and CHESS_CONTENT_PATTERN.search(description):
+    # because the squares it did list didn't form a legal-looking position. "Looks like a
+    # chessboard" is either the literal word, or the model naming chess-specific piece
+    # vocabulary (king/queen/rook/bishop/knight/pawn) even without saying "chess" itself --
+    # other board games described in English (e.g. Chinese chess: chariot/horse/cannon/
+    # elephant/advisor/general/soldier) won't match either pattern, so this doesn't
+    # false-trigger a chess-specific retry on a non-chess board.
+    if not board_fen and (CHESS_CONTENT_PATTERN.search(description) or PIECE_TOKEN_PATTERN.search(description)):
         if emit:
             emit("[file-router] no valid board FEN parsed from a likely chessboard image, retrying vision call once")
         retry_prompt = VISION_PROMPT + (
@@ -370,7 +378,14 @@ def ocr_or_vision_for_visual_content(
     if board_fen:
         description += (
             f"\n\nBoard FEN (piece placement only, parsed from the BOARD_SQUARE lines "
-            f"above and validated with python-chess -- exactly one king per side): {board_fen}"
+            f"above and validated with python-chess -- exactly one king per side): {board_fen}\n"
+            "This is piece placement only. To use it in run_python_code, build the full "
+            "6-field FEN yourself: take the piece-placement string above, then append the "
+            "side to move ('w' or 'b', from whatever the question/image says about whose "
+            "turn it is), then '- - 0 1' for castling/en-passant/move-counters -- e.g. "
+            f"'{board_fen} w - - 0 1' if it's White's turn. Do not submit the piece-placement "
+            "string alone: run_python_code's chess verification only recognizes a full "
+            "6-field FEN."
         )
     return description
 

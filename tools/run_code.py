@@ -79,10 +79,14 @@ def _engine_best_move_note(board: chess.Board) -> str | None:
         return None
     if result.move is None:
         return None
+    side_to_move = "white" if board.turn else "black"
     return (
-        f"[run_python_code auto-analysis: a FEN was detected in your code, so this "
-        f"engine-verified best move for the side to move was computed automatically -- "
-        f"{result.move.uci()} (standard algebraic notation: {board.san(result.move)})]"
+        f"[run_python_code auto-analysis: a FEN was detected in your code, so a real "
+        f"chess engine computed this best move -- but only assuming the FEN's "
+        f"side-to-move field ({side_to_move} to move) is correct; this tool has no way "
+        f"to verify that independently, so confirm it matches the question/image before "
+        f"trusting the move -- {result.move.uci()} "
+        f"(standard algebraic notation: {board.san(result.move)})]"
     )
 
 
@@ -113,8 +117,6 @@ def run_python_code(code: str) -> str:
             text=True,
             timeout=TIMEOUT_SECONDS,
         )
-        board = _find_board(code, result.stdout)
-
         if result.returncode != 0:
             output = f"RUN_CODE_ERROR: {result.stderr.strip()[-MAX_OUTPUT_CHARS:]}"
         else:
@@ -124,15 +126,16 @@ def run_python_code(code: str) -> str:
                 if stdout
                 else "RUN_CODE_NO_OUTPUT: the code ran successfully but printed nothing. Add print() around the value you need."
             )
+            board = _find_board(code, result.stdout)
             if board is not None and stdout:
                 output = _annotate_uci_moves_with_san(output, board)
 
-        # Regardless of whether the model's own code succeeded at invoking an engine
-        # itself, compute the answer ourselves if a real one is installed and available.
-        if board is not None:
-            engine_note = _engine_best_move_note(board)
-            if engine_note:
-                output = f"{output}\n\n{engine_note}"
+            # Regardless of whether the model's own code succeeded at invoking an engine
+            # itself, compute the answer ourselves if a real one is installed and available.
+            if board is not None:
+                engine_note = _engine_best_move_note(board)
+                if engine_note:
+                    output = f"{output}\n\n{engine_note}"
 
         return output[-MAX_OUTPUT_CHARS:]
     except subprocess.TimeoutExpired:
