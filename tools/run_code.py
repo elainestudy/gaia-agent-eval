@@ -60,13 +60,23 @@ def _annotate_uci_moves_with_san(output: str, board: chess.Board) -> str:
     return UCI_MOVE_PATTERN.sub(annotate, output)
 
 
-def _engine_best_move_note(board: chess.Board) -> str | None:
+def _format_score(score: chess.engine.PovScore, turn: chess.Color) -> str:
+    relative = score.pov(turn)
+    mate = relative.mate()
+    if mate is not None:
+        return f"mate in {abs(mate)}"
+    cp = relative.score()
+    return "n/a" if cp is None else f"{cp / 100:+.2f}"
+
+
+def _engine_candidate_moves_note(board: chess.Board, multipv: int = 3) -> str | None:
     """Detecting a FEN is a strong signal the code is solving a chess-position question --
-    computing the actual best move ourselves with a real engine (if one is installed)
-    removes the need to trust the model's own boilerplate for invoking one correctly. In
-    practice it reliably guesses a wrong hardcoded engine install path and gives up
-    instead, falling back to unverified manual reasoning -- this runs in our own trusted
-    process, not the sandboxed subprocess, so it isn't subject to that failure mode."""
+    but computing a single "best" move ourselves and handing it over as the answer lets a
+    real engine's raw evaluation silently override the model's own judgment. When a
+    position has more than one objectively winning move (common in "find the move that
+    wins" puzzles), the highest-eval move is not necessarily the one a puzzle's answer key
+    expects -- so surface the engine's top candidates with their evaluation and likely
+    follow-up instead, and leave picking one to the model."""
     if board.is_game_over():
         return None
     engine_path = shutil.which("stockfish")
@@ -74,19 +84,35 @@ def _engine_best_move_note(board: chess.Board) -> str | None:
         return None
     try:
         with chess.engine.SimpleEngine.popen_uci(engine_path) as engine:
-            result = engine.play(board, chess.engine.Limit(time=1.5))
+            infos = engine.analyse(board, chess.engine.Limit(time=1.5), multipv=multipv)
     except Exception:
         return None
-    if result.move is None:
+
+    lines = []
+    for entry in infos:
+        pv = entry.get("pv")
+        score = entry.get("score")
+        if not pv or score is None:
+            continue
+        preview_board = board.copy()
+        sans = []
+        for move in pv[:4]:
+            sans.append(preview_board.san(move))
+            preview_board.push(move)
+        lines.append(f"{sans[0]} (score: {_format_score(score, board.turn)}, likely continuation: {' '.join(sans)})")
+    if not lines:
         return None
+
     side_to_move = "white" if board.turn else "black"
+    candidates = "\n".join(f"  - {line}" for line in lines)
     return (
-        f"[run_python_code auto-analysis: a FEN was detected in your code, so a real "
-        f"chess engine computed this best move -- but only assuming the FEN's "
-        f"side-to-move field ({side_to_move} to move) is correct; this tool has no way "
-        f"to verify that independently, so confirm it matches the question/image before "
-        f"trusting the move -- {result.move.uci()} "
-        f"(standard algebraic notation: {board.san(result.move)})]"
+        f"[run_python_code auto-analysis: a FEN was detected in your code ({side_to_move} "
+        f"to move per that FEN -- confirm this matches the question/image). A real chess "
+        f"engine's top {len(lines)} legal candidate moves, highest-scoring first:\n{candidates}\n"
+        "Score is the engine's raw evaluation, not a verdict: if more than one candidate is "
+        "clearly winning, the highest score is not automatically the answer the question "
+        "wants -- judge which candidate best fits the question yourself rather than "
+        "defaulting to the top score.]"
     )
 
 
@@ -131,9 +157,10 @@ def run_python_code(code: str) -> str:
                 output = _annotate_uci_moves_with_san(output, board)
 
             # Regardless of whether the model's own code succeeded at invoking an engine
-            # itself, compute the answer ourselves if a real one is installed and available.
+            # itself, surface candidate moves ourselves if a real one is installed and
+            # available -- as information to weigh, not a chosen answer.
             if board is not None:
-                engine_note = _engine_best_move_note(board)
+                engine_note = _engine_candidate_moves_note(board)
                 if engine_note:
                     output = f"{output}\n\n{engine_note}"
 

@@ -22,7 +22,7 @@ The one place this budget doesn't protect you: `build-jsonl` walks through every
   - `video_local.py` — for videos with no transcript: downloads a low-res copy, samples frames, and captions them with a local Ollama vision model to build a "video state report."
   - `file_router.py` — routes task attachments (text/image/video/audio/spreadsheet) and builds evidence text from them: image attachments go through **Gemini's own multimodal input** (far more reliable than the local model for precise structured reading, e.g. chessboard positions — video frames still use the local model, since a video can produce many sampled frames and a GAIA task has at most one image), audio is transcribed with a local `faster-whisper` model, spreadsheets are parsed with `pandas`. PDF is still unsupported. See [Known issues](#known-issues) below for how it works around a broken upstream endpoint.
   - `fetch_page.py` — fetches a known URL's actual page text (via Jina Reader, or directly for Wayback Machine snapshots) for reading-comprehension tasks where a search snippet isn't specific enough, or where a question needs a page's state as of a past date rather than today's.
-  - `run_code.py` — runs Python the agent writes for math/aggregation beyond WolframAlpha, or to execute an attached script. For chess-puzzle questions it also backstops two things the model reliably gets wrong on its own: it runs a real chess engine itself (if `stockfish` is installed) whenever it detects a FEN in the submitted code, and auto-converts any legal UCI move in the output to standard algebraic notation — regardless of whether the model's own code does either correctly.
+  - `run_code.py` — runs Python the agent writes for math/aggregation beyond WolframAlpha, or to execute an attached script. For chess-puzzle questions it also backstops two things the model reliably gets wrong on its own: it auto-converts any legal UCI move in the output to standard algebraic notation regardless of whether the model's own code does so correctly, and (if `stockfish` is installed) surfaces the engine's top few legal candidate moves with their evaluation and a short follow-up line whenever it detects a FEN in the submitted code — as information for the model to weigh, not a chosen answer, since a position can have more than one objectively winning move and the highest-eval one isn't necessarily the one a puzzle's answer key expects.
 
 ## Setup
 
@@ -39,7 +39,7 @@ HF_TOKEN=your_hf_token                   # optional, read-only is enough — nee
 Additional runtime dependencies:
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) must be on `PATH` for the local video-analysis flow.
 - A local [Ollama](https://ollama.com) server (`localhost:11434`, model `minicpm-v:8b`) must be running for video frame captioning.
-- [Stockfish](https://stockfishchess.org/) should be on `PATH` for reliably solving chess-puzzle questions — `run_python_code` still works without it, just without the auto-verified best move.
+- [Stockfish](https://stockfishchess.org/) should be on `PATH` for chess-puzzle questions — `run_python_code` still works without it, just without the candidate-move analysis.
 
 ## Usage
 
@@ -80,3 +80,9 @@ This is a bug in the course's own scoring API, not in this repo — tracked in [
 Without either, attachment-bearing tasks whose files 404 just silently fall back to no evidence, same as before this workaround existed.
 
 Audio and spreadsheet attachments are now parsed once fetched (local `faster-whisper` transcription, `pandas`-based spreadsheet-to-CSV), so all 5 known-404 tasks in the course's task set now get real evidence instead of a refusal or a guess. PDF attachments are still unsupported.
+
+### Chessboard-image tasks are unreliable, and not just in this repo
+
+The one chess-position task in the GAIA set (read a board from an image, find the move that "guarantees a win") is a known hard case: vision-language models are unreliable at reading a chessboard from an image in the first place, independent of whatever solves the position afterward. Princeton's [Holistic Agent Leaderboard reliability analysis](https://hal.cs.princeton.edu/reliability/benchmark/gaia/analysis/) documents a Gemini 2.5 Pro-based agent hallucinating three different, mutually exclusive board states across three runs of this exact task, each asserted with 95–100% confidence and no verification step.
+
+This repo's `gemini_vision_describe` isn't immune to the same failure mode — it can misread a square differently across separate calls on the same static image, and there's no retry-with-voting for it (that would cost extra model requests per task, which conflicts with the ≤10-requests-per-task budget above). Even when the board is read correctly, `run_python_code`'s chess backstop (`_engine_candidate_moves_note` in `tools/run_code.py`) now surfaces the engine's top few candidate moves with their evaluation instead of picking one — because the position can have more than one objectively winning move, and the highest-eval one isn't necessarily the one the puzzle's answer key expects (verified directly on this task's own image: Stockfish's top choice by evaluation is not the answer GAIA accepts for it). Deciding which candidate fits the question is left to the model, so a correct board reading still doesn't guarantee a correct final answer, but at least the tool no longer asserts a specific wrong one with unearned confidence.
