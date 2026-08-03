@@ -60,11 +60,27 @@ def _annotate_uci_moves_with_san(output: str, board: chess.Board) -> str:
     return UCI_MOVE_PATTERN.sub(annotate, output)
 
 
+# How many plies of each candidate's principal variation to preview in the note -- kept as
+# a named constant alongside `multipv` below rather than an inline literal.
+CONTINUATION_PREVIEW_PLIES = 4
+# Candidates within this many centipawns of each other are treated as too close to rank by
+# raw score alone (the eval gap, not just the count of candidates, is what makes a position
+# genuinely ambiguous).
+CLOSE_CANDIDATES_THRESHOLD_CP = 100
+
+
 def _format_score(score: chess.engine.PovScore, turn: chess.Color) -> str:
     relative = score.pov(turn)
     mate = relative.mate()
     if mate is not None:
-        return f"mate in {abs(mate)}"
+        # mate() is negative when `turn` is the side getting mated, not delivering it --
+        # collapsing that into abs() would print "mate in N" identically for a winning and
+        # a losing line, which defeats the point of this note.
+        if mate > 0:
+            return f"mate in {mate}"
+        if mate < 0:
+            return f"getting mated in {abs(mate)}"
+        return "mate"
     cp = relative.score()
     return "n/a" if cp is None else f"{cp / 100:+.2f}"
 
@@ -89,6 +105,7 @@ def _engine_candidate_moves_note(board: chess.Board, multipv: int = 3) -> str | 
         return None
 
     lines = []
+    comparable_scores = []
     for entry in infos:
         pv = entry.get("pv")
         score = entry.get("score")
@@ -96,12 +113,34 @@ def _engine_candidate_moves_note(board: chess.Board, multipv: int = 3) -> str | 
             continue
         preview_board = board.copy()
         sans = []
-        for move in pv[:4]:
+        for move in pv[:CONTINUATION_PREVIEW_PLIES]:
             sans.append(preview_board.san(move))
             preview_board.push(move)
         lines.append(f"{sans[0]} (score: {_format_score(score, board.turn)}, likely continuation: {' '.join(sans)})")
+        # A single scale comparable across cp and mate scores, so a real eval gap (not just
+        # the number of lines) is what decides whether the candidates are actually close.
+        comparable_scores.append(score.pov(board.turn).score(mate_score=100_000))
     if not lines:
         return None
+
+    if len(lines) == 1:
+        verdict_note = (
+            "This was the only candidate the engine could analyze cleanly, so there's nothing "
+            "to compare it against -- still confirm it matches what the question specifically "
+            "asks for."
+        )
+    elif (comparable_scores[0] - comparable_scores[-1]) < CLOSE_CANDIDATES_THRESHOLD_CP:
+        verdict_note = (
+            "These candidates are close enough in evaluation that more than one may be "
+            "objectively winning -- judge which one best fits the question yourself rather "
+            "than defaulting to the top score."
+        )
+    else:
+        verdict_note = (
+            "The top candidate is a clear leader by evaluation, but this score doesn't know "
+            "what the question specifically asks for (e.g. a forced mate vs. simply winning "
+            "material) -- confirm it actually fits before using it."
+        )
 
     side_to_move = "white" if board.turn else "black"
     candidates = "\n".join(f"  - {line}" for line in lines)
@@ -109,10 +148,7 @@ def _engine_candidate_moves_note(board: chess.Board, multipv: int = 3) -> str | 
         f"[run_python_code auto-analysis: a FEN was detected in your code ({side_to_move} "
         f"to move per that FEN -- confirm this matches the question/image). A real chess "
         f"engine's top {len(lines)} legal candidate moves, highest-scoring first:\n{candidates}\n"
-        "Score is the engine's raw evaluation, not a verdict: if more than one candidate is "
-        "clearly winning, the highest score is not automatically the answer the question "
-        "wants -- judge which candidate best fits the question yourself rather than "
-        "defaulting to the top score.]"
+        f"Score is the engine's raw evaluation, not a verdict: {verdict_note}]"
     )
 
 
