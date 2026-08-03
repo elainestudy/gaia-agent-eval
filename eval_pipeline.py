@@ -212,9 +212,30 @@ def solve_question(question: dict[str, Any], verbose: bool = False, diagnostics:
 
 
 def write_jsonl(results: list[dict[str, Any]], output_file: Path = DEFAULT_OUTPUT_FILE) -> None:
-    with output_file.open("w", encoding="utf-8") as handle:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = output_file.with_name(output_file.name + ".tmp")
+    with tmp_file.open("w", encoding="utf-8") as handle:
         for item in results:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_file, output_file)
+
+
+def _read_jsonl_records(output_file: Path) -> list[dict[str, Any]]:
+    if not output_file.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with output_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped_line = line.strip()
+            if not stripped_line:
+                continue
+            try:
+                records.append(json.loads(stripped_line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
 NUMERIC_QUESTION_HINTS = (
@@ -280,23 +301,11 @@ def clean_model_answer(answer: Any, question_text: str | None = None) -> str:
 
 
 def load_existing_task_ids(output_file: Path) -> set[str]:
-    if not output_file.exists():
-        return set()
-
-    existing_task_ids: set[str] = set()
-    with output_file.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            stripped_line = line.strip()
-            if not stripped_line:
-                continue
-            try:
-                record = json.loads(stripped_line)
-            except json.JSONDecodeError:
-                continue
-            task_id = record.get("task_id")
-            if task_id is not None:
-                existing_task_ids.add(str(task_id))
-    return existing_task_ids
+    return {
+        str(record["task_id"])
+        for record in _read_jsonl_records(output_file)
+        if record.get("task_id") is not None
+    }
 
 
 def test_single_random_question(verbose: bool = True) -> None:
@@ -328,6 +337,27 @@ def append_jsonl_record(output_file: Path, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def upsert_jsonl_record(output_file: Path, record: dict[str, Any]) -> str:
+    """Insert or replace the record for record['task_id'] in output_file.
+
+    Returns "added", "updated", or "unchanged" so callers can log what happened.
+    """
+    task_id = str(record["task_id"])
+    existing_records = _read_jsonl_records(output_file)
+
+    for index, existing in enumerate(existing_records):
+        if str(existing.get("task_id")) == task_id:
+            if existing.get("model_answer") == record.get("model_answer"):
+                return "unchanged"
+            existing_records[index] = record
+            write_jsonl(existing_records, output_file)
+            return "updated"
+
+    existing_records.append(record)
+    write_jsonl(existing_records, output_file)
+    return "added"
 
 
 def build_answer_jsonl(output_file: Path = DEFAULT_OUTPUT_FILE, verbose: bool = False) -> list[dict[str, Any]]:
@@ -393,7 +423,13 @@ def submit_answers(username: str, agent_code: str, answers: list[dict[str, Any]]
     return post_json(f"{API_BASE}/submit", payload)
 
 
-def submit_one_question(username: str, agent_path: Path, task_id: str | None = None, verbose: bool = True) -> None:
+def submit_one_question(
+    username: str,
+    agent_path: Path,
+    task_id: str | None = None,
+    verbose: bool = True,
+    output_file: Path = DEFAULT_OUTPUT_FILE,
+) -> None:
     if task_id:
         question = get_question_by_task_id(task_id)
         print(f"Testing submit with fixed task_id={task_id}")
@@ -407,32 +443,52 @@ def submit_one_question(username: str, agent_path: Path, task_id: str | None = N
     print(f"Attachment detected: {question_has_attachment(question)}")
 
     try:
-        answer = solve_question(question, verbose=verbose)
+        diagnostics: dict[str, Any] = {}
+        answer = solve_question(question, verbose=verbose, diagnostics=diagnostics)
     except Exception as exc:
         print(f"[submit-one failed during solve] {exc}")
         raise
 
+    clean_answer = clean_model_answer(answer, base_question)
     agent_code = load_agent_code(agent_path)
     response = submit_answers(
         username=username,
         agent_code=agent_code,
-        answers=[{"task_id": task_id, "model_answer": clean_model_answer(answer, base_question)}],
+        answers=[{"task_id": task_id, "model_answer": clean_answer}],
     )
-    print(f"clean_answer: {clean_model_answer(answer, base_question)}")
+    print(f"clean_answer: {clean_answer}")
     print(json.dumps(response, ensure_ascii=False, indent=2))
+
+    correct_count = response.get("correct_count")
+    total_attempted = response.get("total_attempted")
+    if total_attempted and correct_count == total_attempted:
+        record = {
+            "task_id": task_id,
+            "model_answer": clean_answer,
+            "used_fallback": diagnostics.get("used_fallback", False),
+        }
+        status = upsert_jsonl_record(output_file, record)
+        if status == "added":
+            print(f"✅ Correct — added task {task_id} to {output_file}.")
+        elif status == "updated":
+            print(f"✅ Correct — replaced the existing answer for task {task_id} in {output_file}.")
+        else:
+            print(f"✅ Correct — {output_file} already had this answer for task {task_id}; no change needed.")
 
 
 def submit_all_answers(username: str, agent_path: Path, output_file: Path = DEFAULT_OUTPUT_FILE) -> None:
     if not output_file.exists():
         raise FileNotFoundError(f"{output_file} does not exist. Run --mode build-jsonl first.")
 
-    records: list[dict[str, Any]] = []
-    with output_file.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
+    records = _read_jsonl_records(output_file)
+
+    total_lines = sum(1 for line in output_file.read_text(encoding="utf-8").splitlines() if line.strip())
+    if len(records) < total_lines:
+        print(
+            f"⚠️  {total_lines - len(records)} line(s) in {output_file} could not be parsed as JSON "
+            "and were skipped -- those tasks will NOT be submitted. Fix or remove the bad line(s) "
+            "and re-run before relying on this submission."
+        )
 
     if not records:
         raise ValueError(f"{output_file} has no records to submit.")
@@ -494,7 +550,9 @@ def main() -> None:
         submit_all_answers(args.username, agent_path, output_file)
         return
 
-    submit_one_question(args.username, agent_path, task_id=args.task_id or None, verbose=not args.quiet)
+    submit_one_question(
+        args.username, agent_path, task_id=args.task_id or None, verbose=not args.quiet, output_file=output_file
+    )
 
 
 if __name__ == "__main__":
